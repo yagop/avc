@@ -29,12 +29,16 @@ input.mp4: duration 151.068s
 ### encode — re-encode with explicit settings
 
 ```sh
-avc encode -i input.mp4 -o out.mov --codec hevc (--bitrate 8M | --quality 0.75) \
+avc encode -i input.mp4 [-i audio.m4a ...] -o out.mov --codec hevc (--bitrate 8M | --quality 0.75) \
   [--max-bitrate 12M] [--width 1920] [--height 1080] [--keyframe-interval 60] \
   [--start 3.5] [--duration 30] [--audio-bitrate 128k] \
   [--multi-pass] [--replace] [--verbose]
 ```
 
+- `-i` is repeatable: video is re-encoded from the first input that has a video track,
+  audio comes from the first input with audio, subtitle tracks from all inputs.
+  `.srt` inputs become tx3g subtitle tracks (`-i movie.mp4 -i subs.srt`; not with `--hls`).
+  (For full per-track control without re-encoding, use `remux`.)
 - Codecs: `hevc` (default), `h264`. Bitrate accepts `8M`, `8000k`, `8000000`.
 - `--bitrate` is a long-run average target; instantaneous rate can spike well above it.
   `--max-bitrate 22M` adds a peak cap (VBV over a 1s window). Note: Apple's hardware
@@ -73,6 +77,26 @@ Default mapping: first video + first audio track found across inputs, plus all s
 tracks. `--map INDEX:v|a|s` overrides (index = position of the `-i` flag, 0-based).
 Never re-encodes; if a codec can't be written to the target container, the error names
 the file, track type, codec, and container.
+
+`.srt` inputs are converted to a tx3g subtitle track (the one exception to
+"never re-encodes" — SRT is not a media container):
+
+```sh
+avc remux -i movie-h265.mp4 -i subs.srt -o out.mp4
+```
+
+Raw Annex B elementary streams (`.h265`/`.hevc`/`.h264`/`.264`/`.265`, e.g. extracted
+from an mkv) can be wrapped losslessly. They carry no timing, so frame timestamps must
+come from the source container:
+
+```sh
+mkvextract movie.mkv tracks 0:video.h265
+mkvextract movie.mkv timestamps_v2 0:ts.txt
+avc remux -i video.h265 --timestamps ts.txt -o out.mp4
+```
+
+B-frame reordering is reconstructed from the timestamps (PTS from the container, DTS
+derived), so streams with any GOP structure wrap correctly.
 
 ## Errors
 

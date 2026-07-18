@@ -141,3 +141,57 @@ try writeVideo(to: dir.appendingPathComponent("hdr.mov"), settings: [
 
 try writeSubbed(from: video, to: dir.appendingPathComponent("subbed.mov"))
 print("ok")
+
+// raw Annex B HEVC stream + mkvextract-style timestamps_v2 file, from the hdr.mov fixture
+func writeRawAnnexB(from src: URL, streamOut: URL, timestampsOut: URL) throws {
+    let asset = AVURLAsset(url: src)
+    let sema = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var track: AVAssetTrack!
+    asset.loadTracks(withMediaType: .video) { t, _ in track = t!.first; sema.signal() }
+    sema.wait()
+    let reader = try AVAssetReader(asset: asset)
+    let out = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+    reader.add(out)
+    reader.startReading()
+
+    var stream = Data()
+    var pts: [Double] = []
+    let startCode = Data([0, 0, 0, 1])
+    var wroteParams = false
+    while let sample = out.copyNextSampleBuffer() {
+        guard let block = CMSampleBufferGetDataBuffer(sample) else { continue }
+        if !wroteParams, let fd = CMSampleBufferGetFormatDescription(sample) {
+            var count = 0
+            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+            for i in 0..<count {
+                var ptr: UnsafePointer<UInt8>?
+                var size = 0
+                CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, parameterSetIndex: i, parameterSetPointerOut: &ptr, parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                stream.append(startCode)
+                stream.append(Data(bytes: ptr!, count: size))
+            }
+            wroteParams = true
+        }
+        var length = 0
+        var dataPtr: UnsafeMutablePointer<CChar>?
+        CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPtr)
+        let data = Data(bytes: dataPtr!, count: length)
+        // convert 4-byte length prefixes to Annex B start codes
+        var offset = 0
+        while offset + 4 <= data.count {
+            let len = data.subdata(in: offset..<offset + 4).reduce(0) { ($0 << 8) | Int($1) }
+            stream.append(startCode)
+            stream.append(data.subdata(in: offset + 4..<min(offset + 4 + len, data.count)))
+            offset += 4 + len
+        }
+        pts.append(CMSampleBufferGetPresentationTimeStamp(sample).seconds * 1000)
+    }
+    try stream.write(to: streamOut)
+    let ts = "# timestamp format v2\n" + pts.map { String(format: "%.6f", $0) }.joined(separator: "\n") + "\n"
+    try ts.write(to: timestampsOut, atomically: true, encoding: .utf8)
+}
+
+try writeRawAnnexB(from: dir.appendingPathComponent("hdr.mov"),
+                   streamOut: dir.appendingPathComponent("raw.h265"),
+                   timestampsOut: dir.appendingPathComponent("raw-ts.txt"))
+print("ok raw")

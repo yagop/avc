@@ -24,8 +24,8 @@ grepout() { # grepout <desc> <pattern> <cmd...>
 swift build 2>/dev/null || { echo "build failed"; exit 1; }
 mkdir -p $FIX
 
-# fixtures: video/hdr/subtitle via gen-fixtures.swift, audio via avconvert/ffmpeg
-if [[ ! -f $FIX/video.mp4 || ! -f $FIX/hdr.mov || ! -f $FIX/subbed.mov ]]; then
+# fixtures: video/hdr/subtitle/raw via gen-fixtures.swift, audio via avconvert/ffmpeg
+if [[ ! -f $FIX/video.mp4 || ! -f $FIX/hdr.mov || ! -f $FIX/subbed.mov || ! -f $FIX/raw.h265 ]]; then
   swift gen-fixtures.swift $FIX >/dev/null || { echo "fixture generation failed"; exit 1; }
 fi
 if [[ ! -f $FIX/audio.m4a ]]; then
@@ -105,6 +105,29 @@ check "remux carries subtitles" 0 $AVC remux -i $FIX/subbed.mov -o $FIX/t-sub.mp
 grepout "remuxed subtitle intact" "sbtl.*tx3g" $AVC probe -i $FIX/t-sub.mp4
 check "encode passes subtitles through" 0 $AVC encode -i $FIX/subbed.mov -o $FIX/t-sube.mov --bitrate 1M
 grepout "encoded subtitle intact" "sbtl.*tx3g" $AVC probe -i $FIX/t-sube.mov
+
+# srt -> tx3g
+printf '1\n00:00:00,200 --> 00:00:01,000\nHello\n\n2\n00:00:01,200 --> 00:00:01,900\nWorld\n\n' > $FIX/t-subs.srt
+check "remux video+srt" 0 $AVC remux -i $FIX/video.mp4 -i $FIX/t-subs.srt -o $FIX/t-srt.mp4
+grepout "srt became tx3g track" "sbtl.*tx3g" $AVC probe -i $FIX/t-srt.mp4
+strings $FIX/t-srt.mp4 | grep -q Hello && { echo "ok   srt cue text embedded"; ((PASS++)); } || { echo "FAIL srt cue text missing"; ((FAIL++)); }
+if [[ -f $FIX/audio.m4a ]]; then
+  check "encode multi-input video+audio" 0 $AVC encode -i $FIX/video.mp4 -i $FIX/audio.m4a -o $FIX/t-mi.mp4 --bitrate 1M
+  grepout "multi-input has audio track" "soun.*aac" $AVC probe -i $FIX/t-mi.mp4
+fi
+check "encode with srt input" 0 $AVC encode -i $FIX/video.mp4 -o $FIX/t-esrt.mp4 --bitrate 1M -i $FIX/t-subs.srt
+grepout "encode srt became tx3g" "sbtl.*tx3g" $AVC probe -i $FIX/t-esrt.mp4
+check "encode srt with --hls rejected" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-esrt2 --bitrate 1M --hls -i $FIX/t-subs.srt
+check "srt mapped as video rejected" 1 $AVC remux -i $FIX/video.mp4 -i $FIX/t-subs.srt -o $FIX/t-srt2.mp4 --map 1:v
+printf 'garbage without timing\n\n' > $FIX/t-bad.srt
+check "invalid srt exits 2" 2 $AVC remux -i $FIX/video.mp4 -i $FIX/t-bad.srt -o $FIX/t-srt3.mp4
+
+# raw Annex B + timestamps
+check "remux raw h265+timestamps" 0 $AVC remux -i $FIX/raw.h265 --timestamps $FIX/raw-ts.txt -o $FIX/t-raw.mp4
+grepout "wrapped raw is hevc 30fps" "hvc1 640x360 30.000fps" $AVC probe -i $FIX/t-raw.mp4
+check "wrapped raw decodes (encode round-trip)" 0 $AVC encode -i $FIX/t-raw.mp4 -o $FIX/t-rawenc.mp4 --bitrate 1M
+check "raw without --timestamps rejected" 1 $AVC remux -i $FIX/raw.h265 -o $FIX/t-raw2.mp4
+check "raw mapped as audio rejected" 1 $AVC remux -i $FIX/raw.h265 --timestamps $FIX/raw-ts.txt -o $FIX/t-raw3.mp4 --map 0:a
 
 echo "----"
 echo "$PASS passed, $FAIL failed"

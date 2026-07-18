@@ -6,7 +6,7 @@ import VideoToolbox
 struct Encode: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Re-encode video with explicit settings.")
 
-    @Option(name: .shortAndLong, help: "Input file.") var input: String
+    @Option(name: .shortAndLong, help: "Input file (repeatable; video is taken from the first input that has it, audio likewise, subtitles from all).") var input: [String]
     @Option(name: .shortAndLong, help: "Output file (.mov/.mp4/.m4v), or directory with --hls.") var output: String
     @Option(help: "Video codec: hevc or h264.") var codec: String = "hevc"
     @Option(help: "Video bitrate, e.g. 8M, 8000k, 8000000.") var bitrate: String?
@@ -57,24 +57,51 @@ struct Encode: AsyncParsableCommand {
         // fMP4 segment output rejects passthrough audio, so HLS always re-encodes it
         let audioBps = try audioBitrate.map(parseBitrate) ?? (hls ? 128_000 : nil)
 
-        let asset = AVURLAsset(url: URL(fileURLWithPath: input))
-        let (assetDuration, videoTracks, audioTracks, subtitleTracks) = try await mediaOp("loading input \(input)") {
-            (try await asset.load(.duration),
-             try await asset.loadTracks(withMediaType: .video),
-             try await asset.loadTracks(withMediaType: .audio),
-             try await asset.loadTracks(withMediaType: .subtitle))
+        guard !input.isEmpty else { throw ValidationError("at least one -i input required") }
+        // .srt inputs are parsed and synthesized into tx3g tracks, not opened as assets
+        let srt = input.filter { $0.lowercased().hasSuffix(".srt") }
+        let assets = input.compactMap { path in
+            path.lowercased().hasSuffix(".srt") ? nil : AVURLAsset(url: URL(fileURLWithPath: path))
         }
-        guard let videoTrack = videoTracks.first else {
-            throw MediaError("no video track in \(input)")
+        let input = input.filter { !$0.lowercased().hasSuffix(".srt") }
+        var videoPick: (index: Int, track: AVAssetTrack)?
+        var audioPick: (index: Int, track: AVAssetTrack)?
+        var subtitlePicks: [(index: Int, track: AVAssetTrack)] = []
+        for (i, asset) in assets.enumerated() {
+            let (v, a, s) = try await mediaOp("loading input \(input[i])") {
+                (try await asset.loadTracks(withMediaType: .video),
+                 try await asset.loadTracks(withMediaType: .audio),
+                 try await asset.loadTracks(withMediaType: .subtitle))
+            }
+            if videoPick == nil, let track = v.first { videoPick = (i, track) }
+            if audioPick == nil, let track = a.first { audioPick = (i, track) }
+            subtitlePicks.append(contentsOf: s.map { (i, $0) })
+        }
+        guard let (videoIndex, videoTrack) = videoPick else {
+            throw MediaError("no video track in inputs")
+        }
+        let asset = assets[videoIndex]
+        let assetDuration = try await mediaOp("loading duration of \(input[videoIndex])") {
+            try await asset.load(.duration)
         }
 
-        let reader = try mediaOp("creating reader for \(input)") { try AVAssetReader(asset: asset) }
+        // one reader per used input; all share the same trim range
+        let timeRange: CMTimeRange? = (start != nil || duration != nil)
+            ? CMTimeRange(start: CMTime(seconds: start ?? 0, preferredTimescale: 600),
+                          duration: duration.map { CMTime(seconds: $0, preferredTimescale: 600) } ?? .positiveInfinity)
+            : nil
+        var readers: [Int: AVAssetReader] = [:]
+        func readerFor(_ i: Int) throws -> AVAssetReader {
+            if let existing = readers[i] { return existing }
+            let r = try mediaOp("creating reader for \(input[i])") { try AVAssetReader(asset: assets[i]) }
+            if let timeRange { r.timeRange = timeRange }
+            readers[i] = r
+            return r
+        }
+        let reader = try readerFor(videoIndex)
         var readDuration = assetDuration
-        if start != nil || duration != nil {
-            let s = CMTime(seconds: start ?? 0, preferredTimescale: 600)
-            let d = duration.map { CMTime(seconds: $0, preferredTimescale: 600) } ?? .positiveInfinity
-            reader.timeRange = CMTimeRange(start: s, duration: d)
-            readDuration = min(d, assetDuration - s)
+        if let timeRange {
+            readDuration = min(timeRange.duration, assetDuration - timeRange.start)
         }
 
         let (sourceSize, videoFormats) = try await mediaOp("reading video format") {
@@ -162,19 +189,20 @@ struct Encode: AsyncParsableCommand {
                 print("color: \(props[AVVideoColorPrimariesKey] ?? "?") / \(props[AVVideoTransferFunctionKey] ?? "?")"
                     + (color.isHDR ? " [HDR, 10-bit Main10]" : ""))
             }
-            print("audio: \(audioTracks.isEmpty ? "none" : audioBps.map { "aac @ \($0) b/s" } ?? "passthrough")")
+            print("audio: \(audioPick == nil ? "none" : "\(input[audioPick!.index]) " + (audioBps.map { "aac @ \($0) b/s" } ?? "passthrough"))")
             print(hls ? "container: fragmented mp4 + HLS playlist, \(segmentDuration)s segments" : "container: \(fileType.rawValue)")
         }
 
-        var passthroughPairs: [(out: AVAssetReaderTrackOutput, in: AVAssetWriterInput, label: String)] = []
-        if let audioTrack = audioTracks.first {
+        var passthroughPairs: [(out: AVAssetReaderTrackOutput, in: AVAssetWriterInput, reader: AVAssetReader, label: String)] = []
+        if let (audioIndex, audioTrack) = audioPick {
+            let audioReader = try readerFor(audioIndex)
             let audioFormats = try await mediaOp("reading audio format") {
                 try await audioTrack.load(.formatDescriptions)
             }
             let audioOut = AVAssetReaderTrackOutput(
                 track: audioTrack,
                 outputSettings: audioBps == nil ? nil : [AVFormatIDKey: kAudioFormatLinearPCM])
-            reader.add(audioOut)
+            audioReader.add(audioOut)
             let audioIn = AVAssetWriterInput(
                 mediaType: .audio,
                 outputSettings: audioBps.map { [
@@ -186,9 +214,9 @@ struct Encode: AsyncParsableCommand {
                 sourceFormatHint: audioBps == nil ? audioFormats.first : nil)
             audioIn.expectsMediaDataInRealTime = false
             writer.add(audioIn)
-            passthroughPairs.append((audioOut, audioIn, "audio"))
+            passthroughPairs.append((audioOut, audioIn, audioReader, "audio"))
         }
-        for (n, track) in subtitleTracks.enumerated() where !hls {
+        for (n, (subIndex, track)) in subtitlePicks.enumerated() where !hls {
             let formats = try await mediaOp("reading subtitle format") { try await track.load(.formatDescriptions) }
             let subOut = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
             let subIn = AVAssetWriterInput(mediaType: .subtitle, outputSettings: nil, sourceFormatHint: formats.first)
@@ -198,21 +226,41 @@ struct Encode: AsyncParsableCommand {
                 if verbose { print("subtitle track #\(track.trackID) (\(codec)): not writable to \(fileType.rawValue), dropped") }
                 continue
             }
-            reader.add(subOut)
+            let subReader = try readerFor(subIndex)
+            subReader.add(subOut)
             writer.add(subIn)
-            passthroughPairs.append((subOut, subIn, "subtitle #\(n)"))
-            if verbose { print("subtitle track #\(track.trackID): passthrough") }
+            passthroughPairs.append((subOut, subIn, subReader, "subtitle #\(n)"))
+            if verbose { print("subtitle track #\(track.trackID) (\(input[subIndex])): passthrough") }
+        }
+        if !srt.isEmpty && hls {
+            throw ValidationError(".srt inputs cannot be combined with --hls (fMP4 segments do not carry tx3g)")
+        }
+        var srtFeeds: [(samples: [CMSampleBuffer], in: AVAssetWriterInput, label: String)] = []
+        for (n, path) in srt.enumerated() {
+            let text = try mediaOp("reading \(path)") { try String(contentsOfFile: path, encoding: .utf8) }
+            let cues = try parseSRT(text, file: path)
+            let fd = try tx3gFormatDescription()
+            let subIn = AVAssetWriterInput(mediaType: .subtitle, outputSettings: nil, sourceFormatHint: fd)
+            subIn.expectsMediaDataInRealTime = false
+            guard writer.canAdd(subIn) else {
+                throw MediaError("cannot write subtitle track (tx3g) from \(path) into \(fileType.rawValue) container")
+            }
+            writer.add(subIn)
+            if verbose { print("subtitles: \(path) \(cues.count) cues [srt -> tx3g]") }
+            srtFeeds.append((try tx3gSamples(cues, format: fd), subIn, "srt #\(n)"))
         }
 
-        guard reader.startReading() else {
-            throw MediaError("starting reader", underlying: reader.error)
+        for (i, r) in readers {
+            guard r.startReading() else {
+                throw MediaError("starting reader for \(input[i])", underlying: r.error)
+            }
         }
         guard writer.startWriting() else {
             throw MediaError("starting writer", underlying: writer.error)
         }
         writer.startSession(atSourceTime: reader.timeRange.start)
 
-        installSigintCleanup(writers: [writer], readers: [reader], url: outURL, tempDir: tempDir)
+        installSigintCleanup(writers: [writer], readers: Array(readers.values), url: outURL, tempDir: tempDir)
 
         let total = readDuration.seconds
         let timeRangeStart = reader.timeRange.start
@@ -231,7 +279,12 @@ struct Encode: AsyncParsableCommand {
             }
             for pair in passthroughPairs {
                 group.addTask {
-                    try await pump(from: pair.out, to: pair.in, reader: reader, writer: writer, label: pair.label, progress: nil)
+                    try await pump(from: pair.out, to: pair.in, reader: pair.reader, writer: writer, label: pair.label, progress: nil)
+                }
+            }
+            for feed in srtFeeds {
+                group.addTask {
+                    try await pumpSamples(feed.samples, to: feed.in, writer: writer, label: feed.label)
                 }
             }
             try await group.waitForAll()

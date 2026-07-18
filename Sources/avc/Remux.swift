@@ -217,10 +217,73 @@ struct Remux: AsyncParsableCommand {
 
 // MARK: - SRT -> tx3g
 
+/// A styled character range within a cue: offsets are characters (not bytes),
+/// flags per 3GPP TS 26.245: bold 1, italic 2, underline 4.
+struct StyleSpan: Equatable {
+    let start: Int
+    let end: Int
+    let flags: UInt8
+}
+
+/// Scan SRT markup: strip <i>/<b>/<u>/<font> tags, return plain text plus styled
+/// character ranges (character offsets, not bytes — the classic tx3g pitfall).
+func parseSRTMarkup(_ raw: String) -> (text: String, styles: [StyleSpan]) {
+    var text = ""
+    var charFlags: [UInt8] = []
+    var bold = 0, italic = 0, underline = 0
+    var i = raw.startIndex
+    while i < raw.endIndex {
+        if raw[i] == "<", let close = raw[i...].firstIndex(of: ">") {
+            let tag = raw[raw.index(after: i)..<close].lowercased()
+            let name = tag.hasPrefix("/") ? String(tag.dropFirst()) : tag
+            let opening = !tag.hasPrefix("/")
+            let delta = opening ? 1 : -1
+            switch name.split(separator: " ").first.map(String.init) ?? name {
+            case "i": italic = max(0, italic + delta)
+            case "b": bold = max(0, bold + delta)
+            case "u": underline = max(0, underline + delta)
+            case "font": break  // color not carried into tx3g; tag stripped
+            default:
+                // not a known tag: keep the literal '<' and continue scanning after it
+                text.append(raw[i])
+                charFlags.append(currentFlags(bold: bold, italic: italic, underline: underline))
+                i = raw.index(after: i)
+                continue
+            }
+            i = raw.index(after: close)
+            continue
+        }
+        text.append(raw[i])
+        charFlags.append(currentFlags(bold: bold, italic: italic, underline: underline))
+        i = raw.index(after: i)
+    }
+    // trim whitespace, keeping offsets aligned
+    while let f = text.first, f.isWhitespace { text.removeFirst(); charFlags.removeFirst() }
+    while let l = text.last, l.isWhitespace { text.removeLast(); charFlags.removeLast() }
+    // compress per-character flags into spans
+    var styles: [StyleSpan] = []
+    var runStart = 0
+    for idx in 0...charFlags.count {
+        let flags = idx < charFlags.count ? charFlags[idx] : 0
+        let prev = idx > 0 ? charFlags[idx - 1] : 0
+        if idx > 0, flags != prev {
+            if prev != 0 { styles.append(StyleSpan(start: runStart, end: idx, flags: prev)) }
+            runStart = idx
+        }
+        if idx == 0 { runStart = 0 }
+    }
+    return (text, styles)
+}
+
+private func currentFlags(bold: Int, italic: Int, underline: Int) -> UInt8 {
+    (bold > 0 ? 1 : 0) | (italic > 0 ? 2 : 0) | (underline > 0 ? 4 : 0)
+}
+
 struct SRTCue {
     let start: Double
     let end: Double
     let text: String
+    var styles: [StyleSpan] = []
 }
 
 /// Parse SubRip: blocks of "index / HH:MM:SS,mmm --> HH:MM:SS,mmm / text lines" separated by blank lines.
@@ -247,8 +310,9 @@ func parseSRT(_ content: String, file: String) throws -> [SRTCue] {
         else {
             throw MediaError("cannot parse SRT timing line '\(timing)' in \(file)")
         }
-        let text = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !text.isEmpty { cues.append(SRTCue(start: start, end: end, text: text)) }
+        let raw = lines.dropFirst().joined(separator: "\n")
+        let (text, styles) = parseSRTMarkup(raw)
+        if !text.isEmpty { cues.append(SRTCue(start: start, end: end, text: text, styles: styles)) }
     }
     guard !cues.isEmpty else { throw MediaError("no subtitle cues found in \(file)") }
     return cues.sorted { $0.start < $1.start }
@@ -292,16 +356,32 @@ func tx3gSamples(_ cues: [SRTCue], format: CMFormatDescription) throws -> [CMSam
         if cue.start > cursor {
             samples.append(try tx3gSample("", format: format, start: cursor, end: cue.start))
         }
-        samples.append(try tx3gSample(cue.text, format: format, start: max(cue.start, cursor), end: cue.end))
+        samples.append(try tx3gSample(cue.text, format: format, start: max(cue.start, cursor), end: cue.end, styles: cue.styles))
         cursor = max(cursor, cue.end)
     }
     return samples
 }
 
-func tx3gSample(_ text: String, format: CMFormatDescription, start: Double, end: Double) throws -> CMSampleBuffer {
+func tx3gSample(_ text: String, format: CMFormatDescription, start: Double, end: Double,
+                styles: [StyleSpan] = []) throws -> CMSampleBuffer {
     var payload = Data()
     payload.append(contentsOf: be16(text.utf8.count))
     payload.append(Data(text.utf8))
+    if !styles.isEmpty {
+        // TextStyleBox per TS 26.245: size 'styl' count, then 12-byte StyleRecords
+        // {startChar endChar fontID faceFlags fontSize rgba}; offsets are characters
+        payload.append(contentsOf: be32(10 + styles.count * 12))
+        payload.append(Data("styl".utf8))
+        payload.append(contentsOf: be16(styles.count))
+        for span in styles {
+            payload.append(contentsOf: be16(span.start))
+            payload.append(contentsOf: be16(span.end))
+            payload.append(contentsOf: be16(1))            // fontID, matches sample entry
+            payload.append(span.flags)
+            payload.append(12)                              // font size, matches sample entry
+            payload.append(contentsOf: [255, 255, 255, 255]) // white, opaque
+        }
+    }
     var block: CMBlockBuffer?
     var status = CMBlockBufferCreateWithMemoryBlock(
         allocator: nil, memoryBlock: nil, blockLength: payload.count, blockAllocator: nil,

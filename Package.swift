@@ -5,8 +5,7 @@ let package = Package(
     name: "avc",
     platforms: [.macOS(.v14)],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
-        .package(url: "https://github.com/swiftlang/swift-testing", from: "0.12.0"),
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0")
     ],
     targets: [
         .executableTarget(
@@ -16,7 +15,7 @@ let package = Package(
         ),
         .testTarget(
             name: "avcTests",
-            dependencies: ["avc", .product(name: "Testing", package: "swift-testing")],
+            dependencies: ["avc"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

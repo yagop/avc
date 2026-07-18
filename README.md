@@ -116,7 +116,16 @@ removes the partial output file.
 ## Testing
 
 ```sh
-./test.sh
+./test.sh        # unit tests + integration matrix
+```
+
+Unit tests use Swift Testing. With Command Line Tools only (no Xcode), the
+framework paths must be passed explicitly (`test.sh` does this for you):
+
+```sh
+F=/Library/Developer/CommandLineTools/Library/Developer/Frameworks
+L=/Library/Developer/CommandLineTools/Library/Developer/usr/lib
+swift test -Xswiftc -F$F -Xlinker -F$F -Xlinker -rpath -Xlinker $F -Xlinker -rpath -Xlinker $L
 ```
 
 Generates its own fixtures (SDR/HDR video and tx3g subtitles via `gen-fixtures.swift`,

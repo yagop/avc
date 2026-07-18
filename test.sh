@@ -22,6 +22,15 @@ grepout() { # grepout <desc> <pattern> <cmd...>
 }
 
 swift build 2>/dev/null || { echo "build failed"; exit 1; }
+
+# unit tests; with CLT only, Swift Testing's framework paths must be passed explicitly
+TF=/Library/Developer/CommandLineTools/Library/Developer/Frameworks
+TL=/Library/Developer/CommandLineTools/Library/Developer/usr/lib
+if swift test -Xswiftc -F$TF -Xlinker -F$TF -Xlinker -rpath -Xlinker $TF -Xlinker -rpath -Xlinker $TL 2>/dev/null | grep -q "Test run.*passed"; then
+  echo "ok   unit tests"; ((PASS++))
+else
+  echo "FAIL unit tests (run swift test with the flags in README.md for details)"; ((FAIL++))
+fi
 mkdir -p $FIX
 
 # fixtures: video/hdr/subtitle/raw via gen-fixtures.swift, audio via avconvert/ffmpeg

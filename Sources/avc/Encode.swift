@@ -9,7 +9,8 @@ struct Encode: AsyncParsableCommand {
     @Option(name: .shortAndLong, help: "Input file.") var input: String
     @Option(name: .shortAndLong, help: "Output file (.mov/.mp4/.m4v), or directory with --hls.") var output: String
     @Option(help: "Video codec: hevc or h264.") var codec: String = "hevc"
-    @Option(help: "Video bitrate, e.g. 8M, 8000k, 8000000.") var bitrate: String
+    @Option(help: "Video bitrate, e.g. 8M, 8000k, 8000000.") var bitrate: String?
+    @Option(help: "Constant quality 0.0-1.0 instead of a bitrate (Apple Silicon HEVC/H.264).") var quality: Double?
     @Option(help: "Output width (never upscaled past source).") var width: Int?
     @Option(help: "Output height (never upscaled past source).") var height: Int?
     @Option(help: "Max keyframe interval in frames.") var keyframeInterval: Int?
@@ -37,7 +38,22 @@ struct Encode: AsyncParsableCommand {
         if hls && multiPass {
             throw ValidationError("--multi-pass cannot be combined with --hls")
         }
-        let videoBitrate = try parseBitrate(bitrate)
+        switch (bitrate, quality) {
+        case (nil, nil): throw ValidationError("one of --bitrate or --quality is required")
+        case (.some, .some): throw ValidationError("--bitrate and --quality are mutually exclusive")
+        default: break
+        }
+        if let quality, !(0.0...1.0).contains(quality) {
+            throw ValidationError("--quality must be between 0.0 and 1.0")
+        }
+        if quality != nil, maxBitrate != nil {
+            throw ValidationError("--max-bitrate requires --bitrate (rate control), not --quality")
+        }
+        if quality != nil, multiPass {
+            // VT multipass ignores AVVideoQualityKey and produces bloated output
+            throw ValidationError("--multi-pass requires --bitrate; constant quality is single-pass by nature")
+        }
+        let videoBitrate = try bitrate.map(parseBitrate)
         // fMP4 segment output rejects passthrough audio, so HLS always re-encodes it
         let audioBps = try audioBitrate.map(parseBitrate) ?? (hls ? 128_000 : nil)
 
@@ -77,12 +93,14 @@ struct Encode: AsyncParsableCommand {
         let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: videoReaderSettings)
         reader.add(videoOut)
 
-        var compression: [String: Any] = [AVVideoAverageBitRateKey: videoBitrate]
+        var compression: [String: Any] = [:]
+        if let videoBitrate { compression[AVVideoAverageBitRateKey] = videoBitrate }
+        if let quality { compression[AVVideoQualityKey] = quality }
         if let keyframeInterval { compression[AVVideoMaxKeyFrameIntervalKey] = keyframeInterval }
         if let maxBitrate {
             let bps = try parseBitrate(maxBitrate)
-            guard bps >= videoBitrate else {
-                throw ValidationError("--max-bitrate (\(maxBitrate)) must be >= --bitrate (\(bitrate))")
+            guard bps >= videoBitrate! else {
+                throw ValidationError("--max-bitrate (\(maxBitrate)) must be >= --bitrate (\(bitrate!))")
             }
             // undocumented but accepted by AVAssetWriter: [bytes, seconds] VBV window
             compression[kVTCompressionPropertyKey_DataRateLimits as String] = [bps / 8, 1]
@@ -136,7 +154,8 @@ struct Encode: AsyncParsableCommand {
         if multiPass { videoIn.performsMultiPassEncodingIfSupported = true }
         writer.add(videoIn)
         if verbose {
-            print("video: \(codec) \(Int(outSize.width))x\(Int(outSize.height)) @ \(videoBitrate) b/s"
+            let rate = videoBitrate.map { "\($0) b/s" } ?? "quality \(quality!)"
+            print("video: \(codec) \(Int(outSize.width))x\(Int(outSize.height)) @ \(rate)"
                 + (keyframeInterval.map { " keyframe-interval \($0)" } ?? "")
                 + " (source \(Int(sourceSize.width))x\(Int(sourceSize.height)))")
             if let props = color.avProperties {

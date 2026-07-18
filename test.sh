@@ -71,6 +71,14 @@ if [[ -f $FIX/audio.m4a ]]; then
   grepout "reencoded audio 44100Hz" "44100Hz" $AVC probe -i $FIX/t-aac.mp4
 fi
 
+# constant quality
+check "encode with quality" 0 $AVC encode -i $FIX/video.mp4 -o $FIX/t-q.mp4 --quality 0.75
+grepout "quality output is hevc" "hvc1" $AVC probe -i $FIX/t-q.mp4
+check "no bitrate nor quality rejected" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-q2.mp4
+check "bitrate+quality rejected" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-q3.mp4 --bitrate 1M --quality 0.5
+check "quality out of range rejected" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-q4.mp4 --quality 1.5
+check "quality+multipass rejected" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-q5.mp4 --quality 0.5 --multi-pass
+
 # max-bitrate cap
 check "encode with max-bitrate" 0 $AVC encode -i $FIX/video.mp4 -o $FIX/t-cap.mp4 --bitrate 500k --max-bitrate 800k
 check "max-bitrate below bitrate rejected" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-cap2.mp4 --bitrate 1M --max-bitrate 500k

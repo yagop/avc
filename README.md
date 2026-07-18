@@ -29,7 +29,7 @@ input.mp4: duration 151.068s
 ### encode — re-encode with explicit settings
 
 ```sh
-avc encode -i input.mp4 -o out.mov --codec hevc --bitrate 8M \
+avc encode -i input.mp4 -o out.mov --codec hevc (--bitrate 8M | --quality 0.75) \
   [--max-bitrate 12M] [--width 1920] [--height 1080] [--keyframe-interval 60] \
   [--start 3.5] [--duration 30] [--audio-bitrate 128k] \
   [--multi-pass] [--replace] [--verbose]
@@ -37,7 +37,16 @@ avc encode -i input.mp4 -o out.mov --codec hevc --bitrate 8M \
 
 - Codecs: `hevc` (default), `h264`. Bitrate accepts `8M`, `8000k`, `8000000`.
 - `--bitrate` is a long-run average target; instantaneous rate can spike well above it.
-  `--max-bitrate 22M` adds a peak cap (VBV over a 1s window) for streaming or decoder limits.
+  `--max-bitrate 22M` adds a peak cap (VBV over a 1s window). Note: Apple's hardware
+  encoder derates aggressively under a tight cap — keep it at 1.5-2x the average, and only
+  use it when a target device or streaming spec actually requires one (HEVC Level 4.1
+  already guarantees 50 Mb/s peaks decode anywhere at 1080p).
+- `--quality 0.0-1.0` replaces `--bitrate` with constant-quality rate control: uniform
+  visual quality, bits spent where scenes need them. The best choice for "high quality"
+  when file size is flexible. ~0.5 is visually decent, ~0.75 high, ~0.9 near-transparent.
+  Constant quality is single-pass by nature; `--multi-pass` only applies to `--bitrate`
+  (and is rejected otherwise — VideoToolbox's multipass path ignores the quality key and
+  produces bloated output).
 - Dimensions clamp to the source (never upscales); one dimension implies the other by aspect.
 - Audio passes through untouched unless `--audio-bitrate` re-encodes it to AAC.
 - `--multi-pass` uses encoder-driven multipass when supported, silently single-pass otherwise.

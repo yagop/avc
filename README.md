@@ -40,7 +40,6 @@ avc encode -i input.mp4 [-i audio.m4a ...] -o out.mov --codec hevc (--bitrate 8M
 
 - `-i` is repeatable: video is re-encoded from the first input that has a video track,
   audio comes from the first input with audio, subtitle tracks from all inputs.
-  `.srt` inputs become tx3g subtitle tracks (`-i movie.mp4 -i subs.srt`; not with `--hls`).
   (For full per-track control without re-encoding, use `remux`.)
 - Codecs: `hevc` (default), `h264`. Bitrate accepts `8M`, `8000k`, `8000000`.
 - `--bitrate` is a long-run average target; instantaneous rate can spike well above it.
@@ -58,7 +57,9 @@ avc encode -i input.mp4 [-i audio.m4a ...] -o out.mov --codec hevc (--bitrate 8M
 - Audio passes through untouched unless `--audio-bitrate` re-encodes it to AAC.
 - `--multi-pass` uses encoder-driven multipass when supported, silently single-pass otherwise.
 - HDR (PQ/HLG) sources are detected automatically and come out as 10-bit HEVC Main10 with
-  color properties preserved. HDR + `--codec h264` is an error.
+  color properties preserved. HDR + `--codec h264` is an error unless `--sdr` is given.
+- `--sdr` tonemaps HDR sources to 8-bit BT.709 using Apple's system tonemapping — right
+  for "make this watchable on an SDR screen", not a tunable color pipeline.
 - Subtitle tracks (tx3g) pass through.
 
 ### encode --hls — fragmented MP4 / HLS
@@ -80,13 +81,6 @@ Default mapping: first video + first audio track found across inputs, plus all s
 tracks. `--map INDEX:v|a|s` overrides (index = position of the `-i` flag, 0-based).
 Never re-encodes; if a codec can't be written to the target container, the error names
 the file, track type, codec, and container.
-
-`.srt` inputs are converted to a tx3g subtitle track (the one exception to
-"never re-encodes" — SRT is not a media container):
-
-```sh
-avc remux -i movie-h265.mp4 -i subs.srt -o out.mp4
-```
 
 Raw Annex B elementary streams (`.h265`/`.hevc`/`.h264`/`.264`/`.265`, e.g. extracted
 from an mkv) can be wrapped losslessly. They carry no timing, so frame timestamps must
@@ -137,5 +131,6 @@ probe, HDR preservation, HLS output, subtitles, and the error paths.
 
 ## Out of scope
 
-Dolby Vision RPU generation, HDR→SDR tonemapping, subtitle format conversion (SRT/WebVTT),
-closed captions, metadata/timecode tracks.
+Dolby Vision RPU generation, tunable tonemapping operators, subtitle format conversion
+(SRT/WebVTT — use a sidecar `.srt` next to the output instead; embedded tx3g tracks
+still pass through), closed captions, metadata/timecode tracks.

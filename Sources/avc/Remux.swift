@@ -34,8 +34,7 @@ struct Remux: AsyncParsableCommand {
             wanted.append((idx, type))
         }
 
-        // .srt and raw .h264/.h265 inputs are synthesized, not opened as assets
-        let isSRT = input.map { $0.lowercased().hasSuffix(".srt") }
+        // raw .h264/.h265 inputs are synthesized, not opened as assets
         let isRaw = input.map(isRawVideoPath)
         let rawPaths = input.indices.filter { isRaw[$0] }.map { input[$0] }
         guard rawPaths.count <= 1 else {
@@ -49,13 +48,11 @@ struct Remux: AsyncParsableCommand {
             """)
         }
         let assets = input.enumerated().map { i, path in
-            isSRT[i] || isRaw[i] ? nil : AVURLAsset(url: URL(fileURLWithPath: path))
+            isRaw[i] ? nil : AVURLAsset(url: URL(fileURLWithPath: path))
         }
         var selected: [(inputIndex: Int, track: AVAssetTrack)] = []
-        var srtInputs: [Int] = []
         var rawInputs: [Int] = []
         if wanted.isEmpty {
-            srtInputs = isSRT.indices.filter { isSRT[$0] }
             rawInputs = isRaw.indices.filter { isRaw[$0] }
             // first video track + first audio track across inputs, plus all subtitle tracks
             for type in [AVMediaType.video, .audio] {
@@ -79,13 +76,6 @@ struct Remux: AsyncParsableCommand {
             }
         } else {
             for (idx, type) in wanted {
-                if isSRT[idx] {
-                    guard type == .subtitle else {
-                        throw ValidationError("--map \(idx):\(type == .video ? "v" : "a") is invalid; \(input[idx]) is a subtitle file")
-                    }
-                    srtInputs.append(idx)
-                    continue
-                }
                 if isRaw[idx] {
                     guard type == .video else {
                         throw ValidationError("--map \(idx):\(type == .audio ? "a" : "s") is invalid; \(input[idx]) is a raw video stream")
@@ -102,7 +92,7 @@ struct Remux: AsyncParsableCommand {
                 selected.append((idx, track))
             }
         }
-        guard !selected.isEmpty || !srtInputs.isEmpty || !rawInputs.isEmpty else {
+        guard !selected.isEmpty || !rawInputs.isEmpty else {
             throw MediaError("no video or audio tracks found in inputs")
         }
 
@@ -141,12 +131,6 @@ struct Remux: AsyncParsableCommand {
                                    label: "\(track.mediaType.rawValue) #\(i)"))
         }
 
-        // synthesized tx3g tracks from .srt inputs
-        var srtFeeds: [(samples: [CMSampleBuffer], in: AVAssetWriterInput, label: String)] = []
-        for i in srtInputs {
-            srtFeeds.append(try makeSRTFeed(path: input[i], writer: writer, fileType: fileType,
-                                            label: "srt #\(i)", verbose: verbose))
-        }
         var rawFeeds: [(stream: RawStream, in: AVAssetWriterInput, label: String)] = []
         for i in rawInputs {
             let raw = try RawStream(path: input[i], timestamps: parseTimestampsV2(timestamps!))
@@ -178,11 +162,6 @@ struct Remux: AsyncParsableCommand {
             for feed in pumps {
                 group.addTask { try await pump(feed, writer: writer) }
             }
-            for f in srtFeeds {
-                group.addTask {
-                    try await pumpSamples(f.samples, to: f.in, writer: writer, label: f.label)
-                }
-            }
             for f in rawFeeds {
                 group.addTask { [stream = f.stream] in
                     try await pumpSamples(count: stream.frameCount, make: { try stream.makeSample($0) },
@@ -199,15 +178,5 @@ struct Remux: AsyncParsableCommand {
         }
         print("wrote \(output)")
     }
-}
-
-// MARK: - SRT -> tx3g
-
-/// A styled character range within a cue: offsets are characters (not bytes),
-/// flags per 3GPP TS 26.245: bold 1, italic 2, underline 4.
-struct StyleSpan: Equatable {
-    let start: Int
-    let end: Int
-    let flags: UInt8
 }
 

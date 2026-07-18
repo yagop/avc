@@ -18,6 +18,7 @@ struct Encode: AsyncParsableCommand {
     @Option(help: "Re-encode audio to AAC at this bitrate (default: passthrough).") var audioBitrate: String?
     @Option(help: "Start time in seconds.") var start: Double?
     @Option(help: "Duration in seconds.") var duration: Double?
+    @Flag(help: "Tonemap HDR (PQ/HLG) sources to SDR BT.709 (Apple's system tonemapping).") var sdr = false
     @Flag(help: "Multipass encoding when the encoder supports it (falls back to single pass).") var multiPass = false
     @Flag(help: "Write fragmented MP4 segments + HLS playlist into the output directory.") var hls = false
     @Option(help: "HLS segment duration in seconds.") var segmentDuration: Double = 6
@@ -110,15 +111,7 @@ struct Encode: AsyncParsableCommand {
         let fileType: AVFileType = hls ? .mp4 : try containerType(for: URL(fileURLWithPath: output))
 
         guard !input.isEmpty else { throw ValidationError("at least one -i input required") }
-        // .srt inputs are parsed and synthesized into tx3g tracks, not opened as assets
-        let srt = input.filter { $0.lowercased().hasSuffix(".srt") }
-        if !srt.isEmpty && hls {
-            throw ValidationError(".srt inputs cannot be combined with --hls (fMP4 segments do not carry tx3g)")
-        }
-        let assets = input.compactMap { path in
-            path.lowercased().hasSuffix(".srt") ? nil : AVURLAsset(url: URL(fileURLWithPath: path))
-        }
-        let input = input.filter { !$0.lowercased().hasSuffix(".srt") }
+        let assets = input.map { AVURLAsset(url: URL(fileURLWithPath: $0)) }
         let picks = try await pickTracks(assets, paths: input)
         let (videoIndex, videoTrack) = picks.video
         let audioPick = picks.audio
@@ -155,14 +148,20 @@ struct Encode: AsyncParsableCommand {
         }
         let outSize = clampSize(sourceSize, width: width, height: height)
         let color = colorInfo(videoFormats.first)
-        if color.isHDR && videoCodec != .hevc {
-            throw ValidationError("source is HDR (\(color.transfer ?? "?")); h264 cannot carry it, use --codec hevc")
+        // --sdr: the reader requests 8-bit BT.709 output, so AVFoundation's pixel
+        // transfer tonemaps PQ/HLG before we ever see the buffers
+        let outputHDR = color.isHDR && !sdr
+        if outputHDR && videoCodec != .hevc {
+            throw ValidationError("source is HDR (\(color.transfer ?? "?")); h264 cannot carry it — use --codec hevc, or --sdr to tonemap")
         }
 
-        let pixelFormat = color.isHDR
+        let pixelFormat = outputHDR
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        let videoReaderSettings = [kCVPixelBufferPixelFormatTypeKey as String: pixelFormat]
+        var videoReaderSettings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: pixelFormat]
+        if sdr, color.isHDR {
+            videoReaderSettings[AVVideoColorPropertiesKey] = sdr709ColorProperties
+        }
         let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: videoReaderSettings)
         reader.add(videoOut)
 
@@ -178,7 +177,7 @@ struct Encode: AsyncParsableCommand {
             // undocumented but accepted by AVAssetWriter: [bytes, seconds] VBV window
             compression[kVTCompressionPropertyKey_DataRateLimits as String] = [bps / 8, 1]
         }
-        if color.isHDR {
+        if outputHDR {
             compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
         }
         var videoSettings: [String: Any] = [
@@ -187,7 +186,11 @@ struct Encode: AsyncParsableCommand {
             AVVideoHeightKey: Int(outSize.height),
             AVVideoCompressionPropertiesKey: compression,
         ]
-        if let props = color.avProperties { videoSettings[AVVideoColorPropertiesKey] = props }
+        if sdr, color.isHDR {
+            videoSettings[AVVideoColorPropertiesKey] = sdr709ColorProperties
+        } else if let props = color.avProperties {
+            videoSettings[AVVideoColorPropertiesKey] = props
+        }
 
         // writer: plain file, or segment-emitting for HLS. All validation that can fail
         // has run; only now is an existing output deleted (--replace).
@@ -229,7 +232,9 @@ struct Encode: AsyncParsableCommand {
             print("video: \(codec) \(Int(outSize.width))x\(Int(outSize.height)) @ \(rate)"
                 + (keyframeInterval.map { " keyframe-interval \($0)" } ?? "")
                 + " (source \(Int(sourceSize.width))x\(Int(sourceSize.height)))")
-            if let props = color.avProperties {
+            if sdr, color.isHDR {
+                print("color: ITU_R_709_2 [tonemapped from \(color.transfer ?? "HDR")]")
+            } else if let props = color.avProperties {
                 print("color: \(props[AVVideoColorPrimariesKey] ?? "?") / \(props[AVVideoTransferFunctionKey] ?? "?")"
                     + (color.isHDR ? " [HDR, 10-bit Main10]" : ""))
             }
@@ -258,12 +263,6 @@ struct Encode: AsyncParsableCommand {
             passthroughFeeds.append(TrackFeed(out: subOut, input: subIn, reader: subReader, label: "subtitle #\(n)"))
             if verbose { print("subtitle track #\(track.trackID) (\(input[subIndex])): passthrough") }
         }
-        var srtFeeds: [(samples: [CMSampleBuffer], in: AVAssetWriterInput, label: String)] = []
-        for (n, path) in srt.enumerated() {
-            srtFeeds.append(try makeSRTFeed(path: path, writer: writer, fileType: fileType,
-                                            label: "srt #\(n)", verbose: verbose))
-        }
-
         for (i, r) in readers {
             guard r.startReading() else {
                 throw MediaError("starting reader for \(input[i])", underlying: r.error)
@@ -293,11 +292,6 @@ struct Encode: AsyncParsableCommand {
             }
             for feed in passthroughFeeds {
                 group.addTask { try await pump(feed, writer: writer) }
-            }
-            for feed in srtFeeds {
-                group.addTask {
-                    try await pumpSamples(feed.samples, to: feed.in, writer: writer, label: feed.label)
-                }
             }
             try await group.waitForAll()
         }

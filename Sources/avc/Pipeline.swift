@@ -140,6 +140,14 @@ func pump(_ feed: TrackFeed, writer: AVAssetWriter) async throws {
                    writer: writer, label: feed.label, progress: nil)
 }
 
+/// SDR BT.709 color triple, used both to request tonemapped reader output and
+/// to tag the written track.
+let sdr709ColorProperties: [String: String] = [
+    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+]
+
 /// Source color description; isHDR when the transfer function is PQ or HLG.
 func colorInfo(_ fd: CMFormatDescription?) -> (avProperties: [String: String]?, transfer: String?, isHDR: Bool) {
     guard let fd else { return (nil, nil, false) }
@@ -158,13 +166,6 @@ func colorInfo(_ fd: CMFormatDescription?) -> (avProperties: [String: String]?, 
         AVVideoTransferFunctionKey: transfer,
         AVVideoYCbCrMatrixKey: matrix,
     ], transfer, hdr)
-}
-
-/// Feed pre-built samples into a writer input (same contract as pump, but from an array).
-func pumpSamples(_ samples: [CMSampleBuffer], to input: AVAssetWriterInput, writer: AVAssetWriter, label: String) async throws {
-    // safe: the closure only runs on the pump's serial queue
-    nonisolated(unsafe) let samples = samples
-    try await pumpSamples(count: samples.count, make: { samples[$0] }, to: input, writer: writer, label: label)
 }
 
 /// Feed lazily-built samples: `make` runs one sample at a time on the pump queue,

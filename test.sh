@@ -25,7 +25,7 @@ swift build 2>/dev/null || { echo "build failed"; exit 1; }
 mkdir -p $FIX
 
 # fixtures: video/hdr/subtitle/raw via gen-fixtures.swift, audio via avconvert/ffmpeg
-if [[ ! -f $FIX/video.mp4 || ! -f $FIX/hdr.mov || ! -f $FIX/subbed.mov || ! -f $FIX/raw.h265 ]]; then
+if [[ ! -f $FIX/video.mp4 || ! -f $FIX/hdr.mov || ! -f $FIX/subbed.mov || ! -f $FIX/raw.h265 || ! -f $FIX/raw-ts-sorted.txt ]]; then
   swift gen-fixtures.swift $FIX >/dev/null || { echo "fixture generation failed"; exit 1; }
 fi
 if [[ ! -f $FIX/audio.m4a ]]; then
@@ -70,6 +70,19 @@ if [[ -f $FIX/audio.m4a ]]; then
   check "encode audio reencode" 0 $AVC encode -i $FIX/t-mux.mov -o $FIX/t-aac.mp4 --bitrate 1M --audio-bitrate 96k
   grepout "reencoded audio 44100Hz" "44100Hz" $AVC probe -i $FIX/t-aac.mp4
 fi
+
+# validation ordering + numeric bounds (adversarial review regressions)
+echo keepme > $FIX/t-precious.mp4
+check "failed remux with --replace keeps existing output" 2 $AVC remux -i /nonexistent.mp4 -o $FIX/t-precious.mp4 --replace
+grep -q keepme $FIX/t-precious.mp4 && { echo "ok   existing output preserved on failure"; ((PASS++)); } || { echo "FAIL existing output destroyed"; ((FAIL++)); }
+mkdir -p $FIX/t-dir && touch $FIX/t-dir/f
+check "directory as file output rejected" 1 $AVC remux -i $FIX/video.mp4 -o $FIX/t-dir --replace
+[[ -f $FIX/t-dir/f ]] && { echo "ok   directory not deleted"; ((PASS++)); } || { echo "FAIL directory deleted"; ((FAIL++)); }
+check "huge bitrate rejected not crash" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-v1.mp4 --bitrate 1e19M
+check "sub-1k bitrate rejected not crash" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-v2.mp4 --bitrate 0.5
+check "zero width rejected not crash" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-v3.mp4 --bitrate 1M --width 0
+check "start beyond end rejected" 2 $AVC encode -i $FIX/video.mp4 -o $FIX/t-v4.mp4 --bitrate 1M --start 9999
+check "negative start rejected" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-v5.mp4 --bitrate 1M --start=-1
 
 # constant quality
 check "encode with quality" 0 $AVC encode -i $FIX/video.mp4 -o $FIX/t-q.mp4 --quality 0.75
@@ -126,6 +139,8 @@ check "invalid srt exits 2" 2 $AVC remux -i $FIX/video.mp4 -i $FIX/t-bad.srt -o 
 check "remux raw h265+timestamps" 0 $AVC remux -i $FIX/raw.h265 --timestamps $FIX/raw-ts.txt -o $FIX/t-raw.mp4
 grepout "wrapped raw is hevc 30fps" "hvc1 640x360 30.000fps" $AVC probe -i $FIX/t-raw.mp4
 check "wrapped raw decodes (encode round-trip)" 0 $AVC encode -i $FIX/t-raw.mp4 -o $FIX/t-rawenc.mp4 --bitrate 1M
+check "remux raw with sorted (mkvextract) timestamps" 0 $AVC remux -i $FIX/raw.h265 --timestamps $FIX/raw-ts-sorted.txt -o $FIX/t-rawsort.mp4
+check "sorted-ts wrap decodes" 0 $AVC encode -i $FIX/t-rawsort.mp4 -o $FIX/t-rawsortenc.mp4 --bitrate 1M
 check "raw without --timestamps rejected" 1 $AVC remux -i $FIX/raw.h265 -o $FIX/t-raw2.mp4
 check "raw mapped as audio rejected" 1 $AVC remux -i $FIX/raw.h265 --timestamps $FIX/raw-ts.txt -o $FIX/t-raw3.mp4 --map 0:a
 

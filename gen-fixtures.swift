@@ -189,6 +189,10 @@ func writeRawAnnexB(from src: URL, streamOut: URL, timestampsOut: URL) throws {
     try stream.write(to: streamOut)
     let ts = "# timestamp format v2\n" + pts.map { String(format: "%.6f", $0) }.joined(separator: "\n") + "\n"
     try ts.write(to: timestampsOut, atomically: true, encoding: .utf8)
+    // mkvextract-style variant: sorted ascending (presentation order)
+    let sortedName = timestampsOut.deletingPathExtension().lastPathComponent + "-sorted.txt"
+    let sortedTs = "# timestamp format v2\n" + pts.sorted().map { String(format: "%.6f", $0) }.joined(separator: "\n") + "\n"
+    try sortedTs.write(to: timestampsOut.deletingLastPathComponent().appendingPathComponent(sortedName), atomically: true, encoding: .utf8)
 }
 
 try writeRawAnnexB(from: dir.appendingPathComponent("hdr.mov"),

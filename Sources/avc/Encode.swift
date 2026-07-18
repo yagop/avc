@@ -56,10 +56,20 @@ struct Encode: AsyncParsableCommand {
         let videoBitrate = try bitrate.map(parseBitrate)
         // fMP4 segment output rejects passthrough audio, so HLS always re-encodes it
         let audioBps = try audioBitrate.map(parseBitrate) ?? (hls ? 128_000 : nil)
+        if let width, width <= 0 { throw ValidationError("--width must be positive") }
+        if let height, height <= 0 { throw ValidationError("--height must be positive") }
+        if let start, start < 0 { throw ValidationError("--start must be >= 0") }
+        if let duration, duration <= 0 { throw ValidationError("--duration must be positive") }
+        if hls, segmentDuration <= 0 { throw ValidationError("--segment-duration must be positive") }
+        // validate the output extension before anything touches the filesystem
+        let fileType: AVFileType = hls ? .mp4 : try containerType(for: URL(fileURLWithPath: output))
 
         guard !input.isEmpty else { throw ValidationError("at least one -i input required") }
         // .srt inputs are parsed and synthesized into tx3g tracks, not opened as assets
         let srt = input.filter { $0.lowercased().hasSuffix(".srt") }
+        if !srt.isEmpty && hls {
+            throw ValidationError(".srt inputs cannot be combined with --hls (fMP4 segments do not carry tx3g)")
+        }
         let assets = input.compactMap { path in
             path.lowercased().hasSuffix(".srt") ? nil : AVURLAsset(url: URL(fileURLWithPath: path))
         }
@@ -97,6 +107,9 @@ struct Encode: AsyncParsableCommand {
             if let timeRange { r.timeRange = timeRange }
             readers[i] = r
             return r
+        }
+        if let start, start >= assetDuration.seconds {
+            throw MediaError("--start \(start)s is beyond the end of \(input[videoIndex]) (\(fmt(assetDuration)))")
         }
         let reader = try readerFor(videoIndex)
         var readDuration = assetDuration
@@ -143,14 +156,13 @@ struct Encode: AsyncParsableCommand {
         ]
         if let props = color.avProperties { videoSettings[AVVideoColorPropertiesKey] = props }
 
-        // writer: plain file, or segment-emitting for HLS
+        // writer: plain file, or segment-emitting for HLS. All validation that can fail
+        // has run; only now is an existing output deleted (--replace).
         let outURL: URL
-        let fileType: AVFileType
         var segmentSink: SegmentSink?
         let writer: AVAssetWriter
         if hls {
             outURL = URL(fileURLWithPath: output, isDirectory: true)
-            fileType = .mp4
             try prepareHLSDir(outURL, replace: replace)
             writer = AVAssetWriter(contentType: UTType(AVFileType.mp4.rawValue)!)
             writer.outputFileTypeProfile = .mpeg4AppleHLS
@@ -161,7 +173,6 @@ struct Encode: AsyncParsableCommand {
             segmentSink = sink
         } else {
             outURL = try prepareOutput(output, replace: replace)
-            fileType = try containerType(for: outURL)
             writer = try mediaOp("creating writer for \(output)") {
                 try AVAssetWriter(outputURL: outURL, fileType: fileType)
             }
@@ -232,9 +243,6 @@ struct Encode: AsyncParsableCommand {
             passthroughPairs.append((subOut, subIn, subReader, "subtitle #\(n)"))
             if verbose { print("subtitle track #\(track.trackID) (\(input[subIndex])): passthrough") }
         }
-        if !srt.isEmpty && hls {
-            throw ValidationError(".srt inputs cannot be combined with --hls (fMP4 segments do not carry tx3g)")
-        }
         var srtFeeds: [(samples: [CMSampleBuffer], in: AVAssetWriterInput, label: String)] = []
         for (n, path) in srt.enumerated() {
             let text = try mediaOp("reading \(path)") { try String(contentsOfFile: path, encoding: .utf8) }
@@ -292,6 +300,7 @@ struct Encode: AsyncParsableCommand {
         FileHandle.standardError.write(Data("\r".utf8))
 
         await writer.finishWriting()
+        teardownSigintCleanup()
         if writer.status != .completed {
             throw MediaError("finalizing \(output)", underlying: writer.error)
         }
@@ -481,7 +490,11 @@ func parseBitrate(_ s: String) throws -> Int {
     guard let value = Double(digits), value > 0 else {
         throw ValidationError("invalid bitrate '\(s)' (use e.g. 8M, 8000k, 8000000)")
     }
-    return Int(value * Double(multiplier))
+    let bps = value * Double(multiplier)
+    guard bps >= 1000, bps <= 2_000_000_000 else {
+        throw ValidationError("bitrate '\(s)' out of range (1k to 2G bits/s)")
+    }
+    return Int(bps)
 }
 
 func containerType(for url: URL) throws -> AVFileType {
@@ -495,7 +508,11 @@ func containerType(for url: URL) throws -> AVFileType {
 
 func prepareOutput(_ path: String, replace: Bool) throws -> URL {
     let url = URL(fileURLWithPath: path)
-    if FileManager.default.fileExists(atPath: url.path) {
+    var isDir: ObjCBool = false
+    if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) {
+        guard !isDir.boolValue else {
+            throw ValidationError("output \(path) is a directory")
+        }
         guard replace else {
             throw ValidationError("output \(path) exists; pass --replace to overwrite")
         }
@@ -545,3 +562,10 @@ func installSigintCleanup(writers: [AVAssetWriter], readers: [AVAssetReader], ur
 }
 
 nonisolated(unsafe) var sigintSource: DispatchSourceSignal?
+
+/// After finishWriting succeeds the output is complete; a late Ctrl-C must not delete it.
+func teardownSigintCleanup() {
+    sigintSource?.cancel()
+    sigintSource = nil
+    signal(SIGINT, SIG_DFL)
+}

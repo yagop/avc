@@ -43,7 +43,7 @@ rm -rf $FIX/t-*
 # probe
 grepout "probe video shows codec+size" "avc1 640x360" $AVC probe -i $FIX/video.mp4
 check "probe missing file exits 1" 1 $AVC probe -i nope.mp4
-check "probe non-media exits 2" 2 $AVC probe -i PLAN.md
+check "probe non-media exits 2" 2 $AVC probe -i README.md
 
 # encode
 check "encode hevc" 0 $AVC encode -i $FIX/video.mp4 -o $FIX/t-enc.mov --codec hevc --bitrate 1M
@@ -70,6 +70,10 @@ if [[ -f $FIX/audio.m4a ]]; then
   check "encode audio reencode" 0 $AVC encode -i $FIX/t-mux.mov -o $FIX/t-aac.mp4 --bitrate 1M --audio-bitrate 96k
   grepout "reencoded audio 44100Hz" "44100Hz" $AVC probe -i $FIX/t-aac.mp4
 fi
+
+# max-bitrate cap
+check "encode with max-bitrate" 0 $AVC encode -i $FIX/video.mp4 -o $FIX/t-cap.mp4 --bitrate 500k --max-bitrate 800k
+check "max-bitrate below bitrate rejected" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-cap2.mp4 --bitrate 1M --max-bitrate 500k
 
 # v2: multipass
 check "encode multipass" 0 $AVC encode -i $FIX/video.mp4 -o $FIX/t-mp.mov --bitrate 1M --multi-pass

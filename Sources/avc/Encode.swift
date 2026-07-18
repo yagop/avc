@@ -13,6 +13,7 @@ struct Encode: AsyncParsableCommand {
     @Option(help: "Output width (never upscaled past source).") var width: Int?
     @Option(help: "Output height (never upscaled past source).") var height: Int?
     @Option(help: "Max keyframe interval in frames.") var keyframeInterval: Int?
+    @Option(help: "Peak bitrate cap (VBV over 1s window), e.g. 22M.") var maxBitrate: String?
     @Option(help: "Re-encode audio to AAC at this bitrate (default: passthrough).") var audioBitrate: String?
     @Option(help: "Start time in seconds.") var start: Double?
     @Option(help: "Duration in seconds.") var duration: Double?
@@ -78,6 +79,14 @@ struct Encode: AsyncParsableCommand {
 
         var compression: [String: Any] = [AVVideoAverageBitRateKey: videoBitrate]
         if let keyframeInterval { compression[AVVideoMaxKeyFrameIntervalKey] = keyframeInterval }
+        if let maxBitrate {
+            let bps = try parseBitrate(maxBitrate)
+            guard bps >= videoBitrate else {
+                throw ValidationError("--max-bitrate (\(maxBitrate)) must be >= --bitrate (\(bitrate))")
+            }
+            // undocumented but accepted by AVAssetWriter: [bytes, seconds] VBV window
+            compression[kVTCompressionPropertyKey_DataRateLimits as String] = [bps / 8, 1]
+        }
         if color.isHDR {
             compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
         }
@@ -112,6 +121,15 @@ struct Encode: AsyncParsableCommand {
                 try AVAssetWriter(outputURL: outURL, fileType: fileType)
             }
         }
+
+        // multipass temp storage (*.sb-*) otherwise lands next to the output and is not cleaned up
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("avc-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        if !hls {
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            writer.directoryForTemporaryFiles = tempDir
+        }
+        defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         videoIn.expectsMediaDataInRealTime = false
@@ -175,7 +193,7 @@ struct Encode: AsyncParsableCommand {
         }
         writer.startSession(atSourceTime: reader.timeRange.start)
 
-        installSigintCleanup(writers: [writer], readers: [reader], url: outURL)
+        installSigintCleanup(writers: [writer], readers: [reader], url: outURL, tempDir: tempDir)
 
         let total = readDuration.seconds
         let timeRangeStart = reader.timeRange.start
@@ -432,13 +450,14 @@ func clampSize(_ source: CGSize, width: Int?, height: Int?) -> CGSize {
     return CGSize(width: w - w.truncatingRemainder(dividingBy: 2), height: h - h.truncatingRemainder(dividingBy: 2))
 }
 
-func installSigintCleanup(writers: [AVAssetWriter], readers: [AVAssetReader], url: URL) {
+func installSigintCleanup(writers: [AVAssetWriter], readers: [AVAssetReader], url: URL, tempDir: URL? = nil) {
     signal(SIGINT, SIG_IGN)
     let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     source.setEventHandler {
         readers.forEach { $0.cancelReading() }
         writers.forEach { $0.cancelWriting() }
         try? FileManager.default.removeItem(at: url)
+        if let tempDir { try? FileManager.default.removeItem(at: tempDir) }
         FileHandle.standardError.write(Data("\ninterrupted: cancelled writing, removed partial \(url.path)\n".utf8))
         Foundation.exit(2)
     }

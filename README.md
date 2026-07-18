@@ -30,12 +30,14 @@ input.mp4: duration 151.068s
 
 ```sh
 avc encode -i input.mp4 -o out.mov --codec hevc --bitrate 8M \
-  [--width 1920] [--height 1080] [--keyframe-interval 60] \
+  [--max-bitrate 12M] [--width 1920] [--height 1080] [--keyframe-interval 60] \
   [--start 3.5] [--duration 30] [--audio-bitrate 128k] \
   [--multi-pass] [--replace] [--verbose]
 ```
 
 - Codecs: `hevc` (default), `h264`. Bitrate accepts `8M`, `8000k`, `8000000`.
+- `--bitrate` is a long-run average target; instantaneous rate can spike well above it.
+  `--max-bitrate 22M` adds a peak cap (VBV over a 1s window) for streaming or decoder limits.
 - Dimensions clamp to the source (never upscales); one dimension implies the other by aspect.
 - Audio passes through untouched unless `--audio-bitrate` re-encodes it to AAC.
 - `--multi-pass` uses encoder-driven multipass when supported, silently single-pass otherwise.

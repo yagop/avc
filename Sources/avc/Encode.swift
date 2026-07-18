@@ -1,13 +1,12 @@
 import ArgumentParser
 import AVFoundation
-import UniformTypeIdentifiers
 import VideoToolbox
 
 struct Encode: AsyncParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Re-encode video with explicit settings.")
 
     @Option(name: .shortAndLong, help: "Input file (repeatable; video is taken from the first input that has it, audio likewise, subtitles from all).") var input: [String]
-    @Option(name: .shortAndLong, help: "Output file (.mov/.mp4/.m4v), or directory with --hls.") var output: String
+    @Option(name: .shortAndLong, help: "Output file (.mov/.mp4/.m4v).") var output: String
     @Option(help: "Video codec: hevc or h264.") var codec: String = "hevc"
     @Option(help: "Video bitrate, e.g. 8M, 8000k, 8000000.") var bitrate: String?
     @Option(help: "Constant quality 0.0-1.0 instead of a bitrate (Apple Silicon HEVC/H.264).") var quality: Double?
@@ -20,8 +19,6 @@ struct Encode: AsyncParsableCommand {
     @Option(help: "Duration in seconds.") var duration: Double?
     @Flag(help: "Tonemap HDR (PQ/HLG) sources to SDR BT.709 (Apple's system tonemapping).") var sdr = false
     @Flag(help: "Multipass encoding when the encoder supports it (falls back to single pass).") var multiPass = false
-    @Flag(help: "Write fragmented MP4 segments + HLS playlist into the output directory.") var hls = false
-    @Option(help: "HLS segment duration in seconds.") var segmentDuration: Double = 6
     @Flag(help: "Overwrite existing output file.") var replace = false
     @Flag(help: "Print chosen writer settings and mapping decisions.") var verbose = false
 
@@ -81,9 +78,6 @@ struct Encode: AsyncParsableCommand {
         case "h264": videoCodec = .h264
         default: throw ValidationError("unsupported codec '\(codec)' (use hevc or h264)")
         }
-        if hls && multiPass {
-            throw ValidationError("--multi-pass cannot be combined with --hls")
-        }
         switch (bitrate, quality) {
         case (nil, nil): throw ValidationError("one of --bitrate or --quality is required")
         case (.some, .some): throw ValidationError("--bitrate and --quality are mutually exclusive")
@@ -100,15 +94,13 @@ struct Encode: AsyncParsableCommand {
             throw ValidationError("--multi-pass requires --bitrate; constant quality is single-pass by nature")
         }
         let videoBitrate = try bitrate.map(parseBitrate)
-        // fMP4 segment output rejects passthrough audio, so HLS always re-encodes it
-        let audioBps = try audioBitrate.map(parseBitrate) ?? (hls ? 128_000 : nil)
+        let audioBps = try audioBitrate.map(parseBitrate)
         if let width, width <= 0 { throw ValidationError("--width must be positive") }
         if let height, height <= 0 { throw ValidationError("--height must be positive") }
         if let start, start < 0 { throw ValidationError("--start must be >= 0") }
         if let duration, duration <= 0 { throw ValidationError("--duration must be positive") }
-        if hls, segmentDuration <= 0 { throw ValidationError("--segment-duration must be positive") }
         // validate the output extension before anything touches the filesystem
-        let fileType: AVFileType = hls ? .mp4 : try containerType(for: URL(fileURLWithPath: output))
+        let fileType = try containerType(for: URL(fileURLWithPath: output))
 
         guard !input.isEmpty else { throw ValidationError("at least one -i input required") }
         let assets = input.map { AVURLAsset(url: URL(fileURLWithPath: $0)) }
@@ -192,35 +184,17 @@ struct Encode: AsyncParsableCommand {
             videoSettings[AVVideoColorPropertiesKey] = props
         }
 
-        // writer: plain file, or segment-emitting for HLS. All validation that can fail
-        // has run; only now is an existing output deleted (--replace).
-        let outURL: URL
-        var segmentSink: SegmentSink?
-        let writer: AVAssetWriter
-        if hls {
-            outURL = URL(fileURLWithPath: output, isDirectory: true)
-            try prepareHLSDir(outURL, replace: replace)
-            writer = AVAssetWriter(contentType: UTType(AVFileType.mp4.rawValue)!)
-            writer.outputFileTypeProfile = .mpeg4AppleHLS
-            writer.preferredOutputSegmentInterval = CMTime(seconds: segmentDuration, preferredTimescale: 600)
-            writer.initialSegmentStartTime = reader.timeRange.start
-            let sink = SegmentSink(directory: outURL, targetDuration: segmentDuration)
-            writer.delegate = sink
-            segmentSink = sink
-        } else {
-            outURL = try prepareOutput(output, replace: replace)
-            writer = try mediaOp("creating writer for \(output)") {
-                try AVAssetWriter(outputURL: outURL, fileType: fileType)
-            }
+        // all validation that can fail has run; only now is an existing output deleted
+        let outURL = try prepareOutput(output, replace: replace)
+        let writer = try mediaOp("creating writer for \(output)") {
+            try AVAssetWriter(outputURL: outURL, fileType: fileType)
         }
 
         // multipass temp storage (*.sb-*) otherwise lands next to the output and is not cleaned up
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("avc-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
-        if !hls {
-            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            writer.directoryForTemporaryFiles = tempDir
-        }
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        writer.directoryForTemporaryFiles = tempDir
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
@@ -239,7 +213,7 @@ struct Encode: AsyncParsableCommand {
                     + (color.isHDR ? " [HDR, 10-bit Main10]" : ""))
             }
             print("audio: \(audioPick == nil ? "none" : "\(input[audioPick!.0]) " + (audioBps.map { "aac @ \($0) b/s" } ?? "passthrough"))")
-            print(hls ? "container: fragmented mp4 + HLS playlist, \(segmentDuration)s segments" : "container: \(fileType.rawValue)")
+            print("container: \(fileType.rawValue)")
         }
 
         var passthroughFeeds: [TrackFeed] = []
@@ -247,7 +221,7 @@ struct Encode: AsyncParsableCommand {
             passthroughFeeds.append(try await makeAudioFeed(
                 track: audioTrack, reader: readerFor(audioIndex), writer: writer, audioBps: audioBps))
         }
-        for (n, (subIndex, track)) in subtitlePicks.enumerated() where !hls {
+        for (n, (subIndex, track)) in subtitlePicks.enumerated() {
             let formats = try await mediaOp("reading subtitle format") { try await track.load(.formatDescriptions) }
             let subOut = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
             let subIn = AVAssetWriterInput(mediaType: .subtitle, outputSettings: nil, sourceFormatHint: formats.first)
@@ -302,58 +276,8 @@ struct Encode: AsyncParsableCommand {
         if writer.status != .completed {
             throw MediaError("finalizing \(output)", underlying: writer.error)
         }
-        try segmentSink?.writePlaylist()
         print("wrote \(output)")
     }
 }
 
-/// Receives fMP4 segment data from AVAssetWriter, writes init.mp4 / segN.m4s, builds index.m3u8.
-final class SegmentSink: NSObject, AVAssetWriterDelegate {
-    let directory: URL
-    let targetDuration: Double
-    private var segmentIndex = 0
-    private var entries: [(file: String, duration: Double)] = []
-
-    init(directory: URL, targetDuration: Double) {
-        self.directory = directory
-        self.targetDuration = targetDuration
-    }
-
-    func assetWriter(
-        _ writer: AVAssetWriter, didOutputSegmentData segmentData: Data,
-        segmentType: AVAssetSegmentType, segmentReport: AVAssetSegmentReport?
-    ) {
-        let name: String
-        switch segmentType {
-        case .initialization:
-            name = "init.mp4"
-        case .separable:
-            name = "seg\(segmentIndex).m4s"
-            let duration = segmentReport?.trackReports.map(\.duration.seconds).max() ?? targetDuration
-            entries.append((name, duration))
-            segmentIndex += 1
-        @unknown default:
-            return
-        }
-        try? segmentData.write(to: directory.appendingPathComponent(name))
-    }
-
-    func writePlaylist() throws {
-        var lines = [
-            "#EXTM3U",
-            "#EXT-X-VERSION:7",
-            "#EXT-X-TARGETDURATION:\(Int(entries.map(\.duration).max().map { $0.rounded(.up) } ?? targetDuration))",
-            "#EXT-X-MEDIA-SEQUENCE:0",
-            "#EXT-X-PLAYLIST-TYPE:VOD",
-            "#EXT-X-MAP:URI=\"init.mp4\"",
-        ]
-        for entry in entries {
-            lines.append(String(format: "#EXTINF:%.5f,", entry.duration))
-            lines.append(entry.file)
-        }
-        lines.append("#EXT-X-ENDLIST")
-        try lines.joined(separator: "\n").appending("\n")
-            .write(to: directory.appendingPathComponent("index.m3u8"), atomically: true, encoding: .utf8)
-    }
-}
 

@@ -252,17 +252,6 @@ func prepareOutput(_ path: String, replace: Bool) throws -> URL {
     return url
 }
 
-func prepareHLSDir(_ url: URL, replace: Bool) throws {
-    var isDir: ObjCBool = false
-    if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) {
-        guard replace else {
-            throw ValidationError("output \(url.path) exists; pass --replace to overwrite")
-        }
-        try FileManager.default.removeItem(at: url)
-    }
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-}
-
 /// Clamp requested dimensions to source (never upscale), preserving aspect when one dimension given.
 func clampSize(_ source: CGSize, width: Int?, height: Int?) -> CGSize {
     var w = Double(width ?? Int(source.width))

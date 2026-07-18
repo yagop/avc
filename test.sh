@@ -119,12 +119,6 @@ grepout "sdr output is BT.709" "ITU_R_709_2/ITU_R_709_2" $AVC probe -i $FIX/t-sd
 $AVC probe -i $FIX/t-sdr.mov 2>/dev/null | grep -q " HDR" && { echo "FAIL sdr output still HDR"; ((FAIL++)); } || { echo "ok   sdr output not HDR"; ((PASS++)); }
 check "HDR to h264 with --sdr allowed" 0 $AVC encode -i $FIX/hdr.mov -o $FIX/t-sdr264.mp4 --codec h264 --bitrate 1M --sdr
 
-# v2: HLS / fragmented mp4
-check "encode HLS" 0 $AVC encode -i $FIX/video.mp4 -o $FIX/t-hls --bitrate 1M --hls --segment-duration 1
-[[ -f $FIX/t-hls/init.mp4 && -f $FIX/t-hls/seg0.m4s ]] && { echo "ok   HLS segments written"; ((PASS++)); } || { echo "FAIL HLS segments missing"; ((FAIL++)); }
-grepout "HLS playlist valid" "EXT-X-ENDLIST" cat $FIX/t-hls/index.m3u8
-check "HLS+multipass rejected" 1 $AVC encode -i $FIX/video.mp4 -o $FIX/t-hls2 --bitrate 1M --hls --multi-pass
-
 # v2: subtitles
 grepout "probe shows subtitle track" "sbtl.*tx3g" $AVC probe -i $FIX/subbed.mov
 check "remux carries subtitles" 0 $AVC remux -i $FIX/subbed.mov -o $FIX/t-sub.mp4

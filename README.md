@@ -62,15 +62,6 @@ avc encode -i input.mp4 [-i audio.m4a ...] -o out.mov --codec hevc (--bitrate 8M
   for "make this watchable on an SDR screen", not a tunable color pipeline.
 - Subtitle tracks (tx3g) pass through.
 
-### encode --hls — fragmented MP4 / HLS
-
-```sh
-avc encode -i input.mp4 -o outdir --bitrate 4M --hls --segment-duration 6
-```
-
-Writes `init.mp4`, `segN.m4s`, and a VOD `index.m3u8` into `outdir`. Audio is always
-re-encoded to AAC (128k default) — segment output does not support passthrough audio.
-
 ### remux — combine without re-encoding
 
 ```sh
@@ -127,10 +118,10 @@ swift test -Xswiftc -F$F -Xlinker -F$F -Xlinker -rpath -Xlinker $F -Xlinker -rpa
 
 Generates its own fixtures (SDR/HDR video and tx3g subtitles via `gen-fixtures.swift`,
 audio via `avconvert` or `ffmpeg` if available) and runs the full matrix: encode, remux,
-probe, HDR preservation, HLS output, subtitles, and the error paths.
+probe, HDR preservation, subtitles, and the error paths.
 
 ## Out of scope
 
 Dolby Vision RPU generation, tunable tonemapping operators, subtitle format conversion
 (SRT/WebVTT — use a sidecar `.srt` next to the output instead; embedded tx3g tracks
-still pass through), closed captions, metadata/timecode tracks.
+still pass through), closed captions, metadata/timecode tracks, fragmented MP4 / HLS.

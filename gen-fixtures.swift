@@ -1,5 +1,10 @@
 // Fixture generator for test.sh: swift gen-fixtures.swift <dir>
 // Writes video.mp4 (SDR h264), hdr.mov (HLG 10-bit HEVC), subbed.mov (video + tx3g subtitles).
+//
+// The tx3g atom builder and Annex B extractor here deliberately DUPLICATE the production
+// code in Sources/avc (and the round-trip unit test): a fixture generator that imported
+// the code under test would inherit its bugs. Format correctness of the production side
+// is covered by the Apple-oracle tests; keep these copies independent.
 import AVFoundation
 import VideoToolbox
 

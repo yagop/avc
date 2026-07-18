@@ -28,6 +28,51 @@ struct Encode: AsyncParsableCommand {
         try await exitOnMediaError { try await encode() }
     }
 
+    /// First input with a video track supplies the video, first with audio the audio;
+    /// subtitle tracks come from all inputs.
+    private func pickTracks(_ assets: [AVURLAsset], paths: [String]) async throws
+        -> (video: (Int, AVAssetTrack), audio: (Int, AVAssetTrack)?, subtitles: [(Int, AVAssetTrack)]) {
+        var video: (Int, AVAssetTrack)?
+        var audio: (Int, AVAssetTrack)?
+        var subtitles: [(Int, AVAssetTrack)] = []
+        for (i, asset) in assets.enumerated() {
+            let (v, a, s) = try await mediaOp("loading input \(paths[i])") {
+                (try await asset.loadTracks(withMediaType: .video),
+                 try await asset.loadTracks(withMediaType: .audio),
+                 try await asset.loadTracks(withMediaType: .subtitle))
+            }
+            if video == nil, let track = v.first { video = (i, track) }
+            if audio == nil, let track = a.first { audio = (i, track) }
+            subtitles.append(contentsOf: s.map { (i, $0) })
+        }
+        guard let video else { throw MediaError("no video track in inputs") }
+        return (video, audio, subtitles)
+    }
+
+    /// Audio passes through untouched unless audioBps is set (re-encode to AAC).
+    private func makeAudioFeed(track: AVAssetTrack, reader: AVAssetReader,
+                               writer: AVAssetWriter, audioBps: Int?) async throws -> TrackFeed {
+        let formats = try await mediaOp("reading audio format") {
+            try await track.load(.formatDescriptions)
+        }
+        let out = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: audioBps == nil ? nil : [AVFormatIDKey: kAudioFormatLinearPCM])
+        reader.add(out)
+        let input = AVAssetWriterInput(
+            mediaType: .audio,
+            outputSettings: audioBps.map { [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVEncoderBitRateKey: $0,
+                AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 2,
+            ] },
+            sourceFormatHint: audioBps == nil ? formats.first : nil)
+        input.expectsMediaDataInRealTime = false
+        writer.add(input)
+        return TrackFeed(out: out, input: input, reader: reader, label: "audio")
+    }
+
     func encode() async throws {
         let videoCodec: AVVideoCodecType
         switch codec {
@@ -74,22 +119,10 @@ struct Encode: AsyncParsableCommand {
             path.lowercased().hasSuffix(".srt") ? nil : AVURLAsset(url: URL(fileURLWithPath: path))
         }
         let input = input.filter { !$0.lowercased().hasSuffix(".srt") }
-        var videoPick: (index: Int, track: AVAssetTrack)?
-        var audioPick: (index: Int, track: AVAssetTrack)?
-        var subtitlePicks: [(index: Int, track: AVAssetTrack)] = []
-        for (i, asset) in assets.enumerated() {
-            let (v, a, s) = try await mediaOp("loading input \(input[i])") {
-                (try await asset.loadTracks(withMediaType: .video),
-                 try await asset.loadTracks(withMediaType: .audio),
-                 try await asset.loadTracks(withMediaType: .subtitle))
-            }
-            if videoPick == nil, let track = v.first { videoPick = (i, track) }
-            if audioPick == nil, let track = a.first { audioPick = (i, track) }
-            subtitlePicks.append(contentsOf: s.map { (i, $0) })
-        }
-        guard let (videoIndex, videoTrack) = videoPick else {
-            throw MediaError("no video track in inputs")
-        }
+        let picks = try await pickTracks(assets, paths: input)
+        let (videoIndex, videoTrack) = picks.video
+        let audioPick = picks.audio
+        let subtitlePicks = picks.subtitles
         let asset = assets[videoIndex]
         let assetDuration = try await mediaOp("loading duration of \(input[videoIndex])") {
             try await asset.load(.duration)
@@ -200,32 +233,14 @@ struct Encode: AsyncParsableCommand {
                 print("color: \(props[AVVideoColorPrimariesKey] ?? "?") / \(props[AVVideoTransferFunctionKey] ?? "?")"
                     + (color.isHDR ? " [HDR, 10-bit Main10]" : ""))
             }
-            print("audio: \(audioPick == nil ? "none" : "\(input[audioPick!.index]) " + (audioBps.map { "aac @ \($0) b/s" } ?? "passthrough"))")
+            print("audio: \(audioPick == nil ? "none" : "\(input[audioPick!.0]) " + (audioBps.map { "aac @ \($0) b/s" } ?? "passthrough"))")
             print(hls ? "container: fragmented mp4 + HLS playlist, \(segmentDuration)s segments" : "container: \(fileType.rawValue)")
         }
 
-        var passthroughPairs: [(out: AVAssetReaderTrackOutput, in: AVAssetWriterInput, reader: AVAssetReader, label: String)] = []
+        var passthroughFeeds: [TrackFeed] = []
         if let (audioIndex, audioTrack) = audioPick {
-            let audioReader = try readerFor(audioIndex)
-            let audioFormats = try await mediaOp("reading audio format") {
-                try await audioTrack.load(.formatDescriptions)
-            }
-            let audioOut = AVAssetReaderTrackOutput(
-                track: audioTrack,
-                outputSettings: audioBps == nil ? nil : [AVFormatIDKey: kAudioFormatLinearPCM])
-            audioReader.add(audioOut)
-            let audioIn = AVAssetWriterInput(
-                mediaType: .audio,
-                outputSettings: audioBps.map { [
-                    AVFormatIDKey: kAudioFormatMPEG4AAC,
-                    AVEncoderBitRateKey: $0,
-                    AVSampleRateKey: 44100,
-                    AVNumberOfChannelsKey: 2,
-                ] },
-                sourceFormatHint: audioBps == nil ? audioFormats.first : nil)
-            audioIn.expectsMediaDataInRealTime = false
-            writer.add(audioIn)
-            passthroughPairs.append((audioOut, audioIn, audioReader, "audio"))
+            passthroughFeeds.append(try await makeAudioFeed(
+                track: audioTrack, reader: readerFor(audioIndex), writer: writer, audioBps: audioBps))
         }
         for (n, (subIndex, track)) in subtitlePicks.enumerated() where !hls {
             let formats = try await mediaOp("reading subtitle format") { try await track.load(.formatDescriptions) }
@@ -240,22 +255,13 @@ struct Encode: AsyncParsableCommand {
             let subReader = try readerFor(subIndex)
             subReader.add(subOut)
             writer.add(subIn)
-            passthroughPairs.append((subOut, subIn, subReader, "subtitle #\(n)"))
+            passthroughFeeds.append(TrackFeed(out: subOut, input: subIn, reader: subReader, label: "subtitle #\(n)"))
             if verbose { print("subtitle track #\(track.trackID) (\(input[subIndex])): passthrough") }
         }
         var srtFeeds: [(samples: [CMSampleBuffer], in: AVAssetWriterInput, label: String)] = []
         for (n, path) in srt.enumerated() {
-            let text = try mediaOp("reading \(path)") { try String(contentsOfFile: path, encoding: .utf8) }
-            let cues = try parseSRT(text, file: path)
-            let fd = try tx3gFormatDescription()
-            let subIn = AVAssetWriterInput(mediaType: .subtitle, outputSettings: nil, sourceFormatHint: fd)
-            subIn.expectsMediaDataInRealTime = false
-            guard writer.canAdd(subIn) else {
-                throw MediaError("cannot write subtitle track (tx3g) from \(path) into \(fileType.rawValue) container")
-            }
-            writer.add(subIn)
-            if verbose { print("subtitles: \(path) \(cues.count) cues [srt -> tx3g]") }
-            srtFeeds.append((try tx3gSamples(cues, format: fd), subIn, "srt #\(n)"))
+            srtFeeds.append(try makeSRTFeed(path: path, writer: writer, fileType: fileType,
+                                            label: "srt #\(n)", verbose: verbose))
         }
 
         for (i, r) in readers {
@@ -285,10 +291,8 @@ struct Encode: AsyncParsableCommand {
                     }
                 }
             }
-            for pair in passthroughPairs {
-                group.addTask {
-                    try await pump(from: pair.out, to: pair.in, reader: pair.reader, writer: writer, label: pair.label, progress: nil)
-                }
+            for feed in passthroughFeeds {
+                group.addTask { try await pump(feed, writer: writer) }
             }
             for feed in srtFeeds {
                 group.addTask {
@@ -307,127 +311,6 @@ struct Encode: AsyncParsableCommand {
         try segmentSink?.writePlaylist()
         print("wrote \(output)")
     }
-}
-
-func printProgress(_ pts: Double, start: Double, total: Double, pass: Int = 0) {
-    guard total > 0 else { return }
-    let pct = min(100, (pts - start) / total * 100)
-    let prefix = pass > 0 ? "pass \(pass) " : ""
-    FileHandle.standardError.write(Data(String(format: "\r\(prefix)%3.0f%%", pct).utf8))
-}
-
-/// Multipass driver: pump the first pass from the shared reader, then re-read the
-/// time ranges the encoder requests with fresh readers until it is satisfied.
-func pumpMultiPass(
-    firstPassOut: AVAssetReaderTrackOutput, input: AVAssetWriterInput, firstReader: AVAssetReader,
-    asset: AVAsset, track: AVAssetTrack, readerSettings: [String: Any],
-    writer: AVAssetWriter, total: Double, rangeStart: CMTime
-) async throws {
-    let passQueue = DispatchQueue(label: "avc.pass")
-    // safe: the callback only runs on `passQueue`, which we own
-    nonisolated(unsafe) let input = input
-    let passes = AsyncStream<[CMTimeRange]> { cont in
-        input.respondToEachPassDescription(on: passQueue) {
-            if let desc = input.currentPassDescription {
-                cont.yield(desc.sourceTimeRanges.map(\.timeRangeValue))
-            } else {
-                cont.finish()
-            }
-        }
-    }
-    var passNumber = 0
-    for await ranges in passes {
-        passNumber += 1
-        if passNumber == 1 {
-            try await pump(from: firstPassOut, to: input, reader: firstReader, writer: writer,
-                           label: "video pass 1", finishInput: false) { pts in
-                printProgress(pts, start: rangeStart.seconds, total: total, pass: 1)
-            }
-        } else {
-            for range in ranges {
-                let reader = try mediaOp("creating reader for pass \(passNumber)") { try AVAssetReader(asset: asset) }
-                reader.timeRange = range
-                let out = AVAssetReaderTrackOutput(track: track, outputSettings: readerSettings)
-                reader.add(out)
-                guard reader.startReading() else {
-                    throw MediaError("starting reader for pass \(passNumber)", underlying: reader.error)
-                }
-                let pass = passNumber
-                try await pump(from: out, to: input, reader: reader, writer: writer,
-                               label: "video pass \(pass)", finishInput: false) { pts in
-                    printProgress(pts, start: rangeStart.seconds, total: total, pass: pass)
-                }
-            }
-        }
-        input.markCurrentPassAsFinished()
-    }
-    input.markAsFinished()
-}
-
-/// Pump one track: copyNextSampleBuffer → append, on a serial queue via requestMediaDataWhenReady.
-/// finishInput: false leaves the input open (multipass calls markCurrentPassAsFinished itself).
-func pump(
-    from trackOut: AVAssetReaderTrackOutput, to input: AVAssetWriterInput,
-    reader: AVAssetReader, writer: AVAssetWriter, label: String,
-    finishInput: Bool = true,
-    progress: (@Sendable (Double) -> Void)?
-) async throws {
-    let queue = DispatchQueue(label: "avc.pump.\(label)")
-    // safe: the callback only runs on `queue`, which we own (AVFoundation's intended pattern)
-    nonisolated(unsafe) let input = input
-    nonisolated(unsafe) let trackOut = trackOut
-    nonisolated(unsafe) let reader = reader
-    nonisolated(unsafe) let writer = writer
-    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-        nonisolated(unsafe) var lastPTS = CMTime.invalid
-        nonisolated(unsafe) var done = false
-        input.requestMediaDataWhenReady(on: queue) {
-            guard !done else { return }
-            while input.isReadyForMoreMediaData {
-                guard let sample = trackOut.copyNextSampleBuffer() else {
-                    done = true
-                    if finishInput { input.markAsFinished() }
-                    if reader.status == .failed {
-                        cont.resume(throwing: MediaError(
-                            "reading \(label) sample after \(fmt(lastPTS))", underlying: reader.error))
-                    } else {
-                        cont.resume()
-                    }
-                    return
-                }
-                lastPTS = CMSampleBufferGetPresentationTimeStamp(sample)
-                if !input.append(sample) {
-                    done = true
-                    input.markAsFinished()
-                    reader.cancelReading()
-                    cont.resume(throwing: MediaError(
-                        "appending \(label) sample at \(fmt(lastPTS))", underlying: writer.error))
-                    return
-                }
-                progress?(lastPTS.seconds)
-            }
-        }
-    }
-}
-
-/// Source color description; isHDR when the transfer function is PQ or HLG.
-func colorInfo(_ fd: CMFormatDescription?) -> (avProperties: [String: String]?, transfer: String?, isHDR: Bool) {
-    guard let fd else { return (nil, nil, false) }
-    func ext(_ key: CFString) -> String? {
-        CMFormatDescriptionGetExtension(fd, extensionKey: key) as? String
-    }
-    let primaries = ext(kCMFormatDescriptionExtension_ColorPrimaries)
-    let transfer = ext(kCMFormatDescriptionExtension_TransferFunction)
-    let matrix = ext(kCMFormatDescriptionExtension_YCbCrMatrix)
-    guard let primaries, let transfer, let matrix else { return (nil, transfer, false) }
-    let hdr = transfer == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
-        || transfer == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
-    // CM extension values are the same strings AVVideoSettings expects
-    return ([
-        AVVideoColorPrimariesKey: primaries,
-        AVVideoTransferFunctionKey: transfer,
-        AVVideoYCbCrMatrixKey: matrix,
-    ], transfer, hdr)
 }
 
 /// Receives fMP4 segment data from AVAssetWriter, writes init.mp4 / segN.m4s, builds index.m3u8.
@@ -480,92 +363,3 @@ final class SegmentSink: NSObject, AVAssetWriterDelegate {
     }
 }
 
-func parseBitrate(_ s: String) throws -> Int {
-    let lower = s.lowercased()
-    let multiplier: Int
-    let digits: Substring
-    if lower.hasSuffix("m") { multiplier = 1_000_000; digits = lower.dropLast() }
-    else if lower.hasSuffix("k") { multiplier = 1_000; digits = lower.dropLast() }
-    else { multiplier = 1; digits = lower[...] }
-    guard let value = Double(digits), value > 0 else {
-        throw ValidationError("invalid bitrate '\(s)' (use e.g. 8M, 8000k, 8000000)")
-    }
-    let bps = value * Double(multiplier)
-    guard bps >= 1000, bps <= 2_000_000_000 else {
-        throw ValidationError("bitrate '\(s)' out of range (1k to 2G bits/s)")
-    }
-    return Int(bps)
-}
-
-func containerType(for url: URL) throws -> AVFileType {
-    switch url.pathExtension.lowercased() {
-    case "mov": return .mov
-    case "mp4", "m4v": return .mp4
-    default:
-        throw ValidationError("unknown output extension '.\(url.pathExtension)' (supported: .mov, .mp4, .m4v)")
-    }
-}
-
-func prepareOutput(_ path: String, replace: Bool) throws -> URL {
-    let url = URL(fileURLWithPath: path)
-    var isDir: ObjCBool = false
-    if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) {
-        guard !isDir.boolValue else {
-            throw ValidationError("output \(path) is a directory")
-        }
-        guard replace else {
-            throw ValidationError("output \(path) exists; pass --replace to overwrite")
-        }
-        try FileManager.default.removeItem(at: url)
-    }
-    return url
-}
-
-func prepareHLSDir(_ url: URL, replace: Bool) throws {
-    var isDir: ObjCBool = false
-    if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) {
-        guard replace else {
-            throw ValidationError("output \(url.path) exists; pass --replace to overwrite")
-        }
-        try FileManager.default.removeItem(at: url)
-    }
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-}
-
-/// Clamp requested dimensions to source (never upscale), preserving aspect when one dimension given.
-func clampSize(_ source: CGSize, width: Int?, height: Int?) -> CGSize {
-    var w = Double(width ?? Int(source.width))
-    var h = Double(height ?? Int(source.height))
-    if width != nil && height == nil { h = (source.height * w / source.width).rounded() }
-    if height != nil && width == nil { w = (source.width * h / source.height).rounded() }
-    if w > source.width || h > source.height {
-        let scale = min(source.width / w, source.height / h)
-        w = (w * scale).rounded(); h = (h * scale).rounded()
-    }
-    // even dimensions required by most encoders
-    return CGSize(width: w - w.truncatingRemainder(dividingBy: 2), height: h - h.truncatingRemainder(dividingBy: 2))
-}
-
-func installSigintCleanup(writers: [AVAssetWriter], readers: [AVAssetReader], url: URL, tempDir: URL? = nil) {
-    signal(SIGINT, SIG_IGN)
-    let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    source.setEventHandler {
-        readers.forEach { $0.cancelReading() }
-        writers.forEach { $0.cancelWriting() }
-        try? FileManager.default.removeItem(at: url)
-        if let tempDir { try? FileManager.default.removeItem(at: tempDir) }
-        FileHandle.standardError.write(Data("\ninterrupted: cancelled writing, removed partial \(url.path)\n".utf8))
-        Foundation.exit(2)
-    }
-    source.resume()
-    sigintSource = source
-}
-
-nonisolated(unsafe) var sigintSource: DispatchSourceSignal?
-
-/// After finishWriting succeeds the output is complete; a late Ctrl-C must not delete it.
-func teardownSigintCleanup() {
-    sigintSource?.cancel()
-    sigintSource = nil
-    signal(SIGINT, SIG_DFL)
-}

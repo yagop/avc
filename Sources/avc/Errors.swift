@@ -1,4 +1,5 @@
 import ArgumentParser
+import AVFoundation
 import Foundation
 
 let knownStatus: [Int: (name: String, meaning: String)] = [
@@ -80,7 +81,12 @@ func describe(_ error: Error) -> String {
     var current: NSError? = error as NSError
     var depth = 0
     while let err = current {
-        let code = describe(OSStatus(truncatingIfNeeded: err.code))
+        // symbolic OSStatus names only make sense for CoreMedia/AVFoundation domains;
+        // other domains (Cocoa, POSIX...) get their code printed untranslated
+        let mediaDomain = err.domain == NSOSStatusErrorDomain || err.domain == AVFoundationErrorDomain
+        let code = mediaDomain && err.code >= Int(Int32.min) && err.code <= Int(Int32.max)
+            ? describe(OSStatus(err.code))
+            : "\(err.code)"
         var line = depth == 0 ? "  " : "  " + String(repeating: "   ", count: depth - 1) + "└─ "
         line += "\(err.domain) \(code)"
         if !err.localizedDescription.isEmpty, !err.localizedDescription.hasPrefix("The operation couldn’t be completed") {

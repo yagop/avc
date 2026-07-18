@@ -1,3 +1,6 @@
+<img width="720" alt="dd6fbeca-4876-478a-b744-fc914f216afc" src="https://github.com/user-attachments/assets/e6a66eeb-4b2b-4086-a9a2-5e8d35ec8052" />
+
+
 # avc
 
 A macOS command-line replacement for `avconvert` that does what it can't: custom bitrate

@@ -332,6 +332,8 @@ func tx3gSample(_ text: String, format: CMFormatDescription, start: Double, end:
 
 /// Feed pre-built samples into a writer input (same contract as pump, but from an array).
 func pumpSamples(_ samples: [CMSampleBuffer], to input: AVAssetWriterInput, writer: AVAssetWriter, label: String) async throws {
+    // safe: the closure only runs on the pump's serial queue
+    nonisolated(unsafe) let samples = samples
     try await pumpSamples(count: samples.count, make: { samples[$0] }, to: input, writer: writer, label: label)
 }
 

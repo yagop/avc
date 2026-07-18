@@ -6,54 +6,56 @@ import Foundation
 /// character ranges (character offsets, not bytes — the classic tx3g pitfall).
 func parseSRTMarkup(_ raw: String) -> (text: String, styles: [StyleSpan]) {
     var text = ""
-    var charFlags: [UInt8] = []
+    var count = 0                 // characters appended so far
+    var styles: [StyleSpan] = []
     var bold = 0, italic = 0, underline = 0
+    var flags: UInt8 = 0
+    var runStart = 0
+
+    // a tag boundary may change the active flags: close the open run, start the next
+    func updateFlags() {
+        let new: UInt8 = (bold > 0 ? 1 : 0) | (italic > 0 ? 2 : 0) | (underline > 0 ? 4 : 0)
+        guard new != flags else { return }
+        if flags != 0, count > runStart { styles.append(StyleSpan(start: runStart, end: count, flags: flags)) }
+        flags = new
+        runStart = count
+    }
+
     var i = raw.startIndex
     while i < raw.endIndex {
         if raw[i] == "<", let close = raw[i...].firstIndex(of: ">") {
             let tag = raw[raw.index(after: i)..<close].lowercased()
-            let name = tag.hasPrefix("/") ? String(tag.dropFirst()) : tag
-            let opening = !tag.hasPrefix("/")
-            let delta = opening ? 1 : -1
-            switch name.split(separator: " ").first.map(String.init) ?? name {
+            let delta = tag.hasPrefix("/") ? -1 : 1
+            let name = tag.drop(while: { $0 == "/" }).prefix(while: { $0 != " " })
+            switch name {
             case "i": italic = max(0, italic + delta)
             case "b": bold = max(0, bold + delta)
             case "u": underline = max(0, underline + delta)
-            case "font": break  // color not carried into tx3g; tag stripped
+            case "font": break    // color not carried into tx3g; tag stripped
             default:
                 // not a known tag: keep the literal '<' and continue scanning after it
-                text.append(raw[i])
-                charFlags.append(currentFlags(bold: bold, italic: italic, underline: underline))
+                text.append(raw[i]); count += 1
                 i = raw.index(after: i)
                 continue
             }
+            updateFlags()
             i = raw.index(after: close)
             continue
         }
-        text.append(raw[i])
-        charFlags.append(currentFlags(bold: bold, italic: italic, underline: underline))
+        text.append(raw[i]); count += 1
         i = raw.index(after: i)
     }
-    // trim whitespace, keeping offsets aligned
-    while let f = text.first, f.isWhitespace { text.removeFirst(); charFlags.removeFirst() }
-    while let l = text.last, l.isWhitespace { text.removeLast(); charFlags.removeLast() }
-    // compress per-character flags into spans
-    var styles: [StyleSpan] = []
-    var runStart = 0
-    for idx in 0...charFlags.count {
-        let flags = idx < charFlags.count ? charFlags[idx] : 0
-        let prev = idx > 0 ? charFlags[idx - 1] : 0
-        if idx > 0, flags != prev {
-            if prev != 0 { styles.append(StyleSpan(start: runStart, end: idx, flags: prev)) }
-            runStart = idx
-        }
-        if idx == 0 { runStart = 0 }
+    if flags != 0, count > runStart { styles.append(StyleSpan(start: runStart, end: count, flags: flags)) }
+
+    // trim whitespace; spans shift by the leading trim and clamp to the new length
+    let leading = text.prefix(while: \.isWhitespace).count
+    text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    styles = styles.compactMap { span in
+        let start = max(0, span.start - leading)
+        let end = min(text.count, span.end - leading)
+        return end > start ? StyleSpan(start: start, end: end, flags: span.flags) : nil
     }
     return (text, styles)
-}
-
-private func currentFlags(bold: Int, italic: Int, underline: Int) -> UInt8 {
-    (bold > 0 ? 1 : 0) | (italic > 0 ? 2 : 0) | (underline > 0 ? 4 : 0)
 }
 
 struct SRTCue {

@@ -262,6 +262,8 @@ func pumpMultiPass(
     writer: AVAssetWriter, total: Double, rangeStart: CMTime
 ) async throws {
     let passQueue = DispatchQueue(label: "avc.pass")
+    // safe: the callback only runs on `passQueue`, which we own
+    nonisolated(unsafe) let input = input
     let passes = AsyncStream<[CMTimeRange]> { cont in
         input.respondToEachPassDescription(on: passQueue) {
             if let desc = input.currentPassDescription {
@@ -309,6 +311,11 @@ func pump(
     progress: (@Sendable (Double) -> Void)?
 ) async throws {
     let queue = DispatchQueue(label: "avc.pump.\(label)")
+    // safe: the callback only runs on `queue`, which we own (AVFoundation's intended pattern)
+    nonisolated(unsafe) let input = input
+    nonisolated(unsafe) let trackOut = trackOut
+    nonisolated(unsafe) let reader = reader
+    nonisolated(unsafe) let writer = writer
     try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
         nonisolated(unsafe) var lastPTS = CMTime.invalid
         nonisolated(unsafe) var done = false
